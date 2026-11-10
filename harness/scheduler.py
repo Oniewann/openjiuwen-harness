@@ -162,6 +162,8 @@ class Scheduler:
             refusal = self._gate(solver, step, est)
             if refusal:
                 self._say(solver, f"skip {step}: {refusal}")
+                if refusal == "statically infeasible" and solver.status == "pending" and solver.best is None:
+                    solver.status = "infeasible"   # отсеяна проверкой без модели: answer.txt не создаём
                 self._close(solver, f"{step}: {refusal}")
                 continue
             density = est.p_success * solver.task.reward / max(est.cost, 1.0)
@@ -259,8 +261,32 @@ class Scheduler:
         finally:
             if self.hub.dead and not self.stop_reason:
                 self.stop_reason = self.hub.dead_reason
+            await self._last_resorts()
             for solver in self.solvers:
                 self._close(solver, self.stop_reason and f"run stopped: {self.stop_reason}")
+
+    async def _last_resorts(self) -> None:
+        """Бесплатные последние попытки для задач, оставшихся без ответа (пока есть время)."""
+        pending = [s for s in self.solvers if s.status == "pending" and s.task.task_id not in self.closed]
+        if not pending or time.monotonic() > self.deadline - 20:
+            return
+        limit = asyncio.Semaphore(max(2, min(8, (os.cpu_count() or 4))))
+
+        async def attempt(solver: Solver) -> None:
+            async with limit:
+                try:
+                    await asyncio.to_thread(solver.last_resort)
+                except Exception as exc:  # noqa: BLE001
+                    solver.note("last_resort_error", error=str(exc)[:200])
+            if solver.status == "verified":
+                self._sync_answer(solver)
+                self._say(solver, f"last resort -> {solver.best!r} (verified)")
+
+        budget = max(1.0, min(120.0, self.deadline - time.monotonic() - 10))
+        try:
+            await asyncio.wait_for(asyncio.gather(*(attempt(s) for s in pending)), timeout=budget)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
 
     # ------------------------------------------------------------------ отчёт
     def report(self) -> dict:

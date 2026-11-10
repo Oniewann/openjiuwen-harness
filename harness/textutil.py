@@ -108,13 +108,17 @@ def normalize_answer(raw: str) -> str:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     text = lines[-1] if lines else ""
     text = re.sub(r"^(final answer|answer|result)\s*[:=]\s*", "", text, flags=re.IGNORECASE)
-    text = text.strip().strip("`").strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        text = text[1:-1].strip()
+    for _ in range(3):  # точка в конце и кавычки могут идти в любом порядке: «'Osaka'.», «"Osaka."»
+        before = text
+        text = text.strip().strip("`").strip()
+        if text.endswith(".") and not re.fullmatch(r"-?\d+\.", text) and len(text.split()) <= 6:
+            text = text[:-1].strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+            text = text[1:-1].strip()
+        if text == before:
+            break
     if re.fullmatch(r"-?\d+\.0+", text):
         text = text.split(".")[0]
-    if text.endswith(".") and not re.fullmatch(r"-?\d+\.", text) and len(text.split()) <= 6:
-        text = text[:-1].strip()
     return text
 
 

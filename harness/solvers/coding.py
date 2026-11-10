@@ -9,7 +9,8 @@
   навык      — ремонт перебором мутаций (при HARNESS_FASTPATH — сразу, иначе — как бесплатная
                страховка после первой неудачи модели);
   fast       — модель видит файл и упавшие утверждения, присылает только изменённые функции;
-  fast_retry — то же от текущего лучшего состояния, с исходником тестов;
+  fast_alt   — вторая дешёвая модель: от текущего лучшего состояния, с исходником тестов
+               (другая модель, а не та же ещё раз: её ошибки и отказы меньше связаны с первой);
   strong     — модель с рассуждениями;
   react      — агент openJiuwen с bash в копии каталога.
 После каждой правки тесты запускаются заново; тестовые файлы защищены от изменения.
@@ -38,7 +39,7 @@ _MAX_TEST_CHARS = 4000
 
 class CodingSolver(Solver):
     family = "coding"
-    ladder = ("fast", "fast_retry", "strong", "react")
+    ladder = ("fast", "fast_alt", "strong", "react")
 
     def __init__(self, task, env):
         super().__init__(task, env)
@@ -127,7 +128,26 @@ class CodingSolver(Solver):
             self._accept("mutation repair")
             return True
         self._write(self.current)
+        self._keep_partial(result)
         return False
+
+    def _keep_partial(self, result) -> None:
+        """Перебор починил часть багов: берём это за основу, модели останется меньше работы."""
+        from ..skills import testrun as TR
+
+        partial = {self.ws / rel: text for rel, text in (result.patched_files or {}).items()
+                   if (self.ws / rel) in self.original}
+        if not partial or self.report is None:
+            return
+        candidate = dict(self.original)
+        candidate.update(partial)
+        report = self._try(candidate)
+        better = not report.error and not report.timed_out and set(report.failed) < set(self.report.failed)
+        if better and len(report.failed) < len(self.report.failed):
+            self.current, self.report = candidate, report
+            self.note("repair_partial", still_failing=list(report.failed))
+        else:
+            self._write(self.current)
 
     # ------------------------------------------------------------------ файлы
     def _read_sources(self) -> dict[Path, str]:
@@ -223,6 +243,11 @@ class CodingSolver(Solver):
             remaining = [s for s in remaining if s != "react"]
         return remaining[0] if remaining else None
 
+    def last_resort(self) -> None:
+        """Модель недоступна или не справилась, а перебор мутаций ещё не пробовали — пробуем."""
+        if self.status == "pending" and self.report is not None and not self.report.ok and self.cfg.crosscheck:
+            self._mutation_repair()
+
     def finalize(self) -> None:
         if self.status == "pending":
             self.status = "gave_up"
@@ -258,11 +283,13 @@ class CodingSolver(Solver):
             reply = await self.env.hub.chat(
                 messages, role=role,
                 max_tokens=self.cfg.max_tokens_strong if strong else self.cfg.max_tokens_code,
-                temperature=0.0 if step == "fast" else 0.4)
+                temperature=0.0 if step == "fast" else 0.3)
         self.note(step, model=reply.model, cost=round(reply.cost, 1), prompt_tokens=reply.prompt_tokens,
                   completion_tokens=reply.completion_tokens, reasoning_tokens=reply.reasoning_tokens,
                   finish=reply.finish_reason, **({"reply": reply.text[:800]} if self.env.trace_text else {}))
         if is_refusal(reply.text):
+            if await self._free_repair(step):
+                return Outcome("answer", answer=self.task.sentinel or "DONE")
             return Outcome("refused", note="model says the tests cannot all pass")
 
         files = {self._rel(p): text for p, text in self.current.items()}
@@ -290,11 +317,16 @@ class CodingSolver(Solver):
             else:
                 await asyncio.to_thread(self._write, self.current)
             outcome = Outcome("failed", note=f"tests still fail: {', '.join(report.failed[:5]) or report.error[:80]}")
-        if step == "fast" and not self.cfg.fastpath and self.cfg.crosscheck:
-            # Бесплатная страховка: если баг — мутация одного оператора, перебор найдёт его без модели.
-            if await asyncio.to_thread(self._mutation_repair):
-                return Outcome("answer", answer=self.task.sentinel or "DONE")
+        if await self._free_repair(step):
+            return Outcome("answer", answer=self.task.sentinel or "DONE")
         return outcome
+
+    async def _free_repair(self, step: str) -> bool:
+        """Бесплатная страховка после неудачи модели: если баг — мутация одного оператора,
+        перебор найдёт его без токенов (при fastpath он уже был сделан на подготовке)."""
+        if self.repair_tried or not self.cfg.crosscheck:
+            return False
+        return await asyncio.to_thread(self._mutation_repair)
 
     def _try(self, texts: dict[Path, str]):
         from ..skills import testrun as TR

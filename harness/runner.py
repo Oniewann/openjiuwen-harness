@@ -45,13 +45,17 @@ def prepare_process(scratch: Optional[Path] = None) -> Path:
 
 
 def quiet_openjiuwen(log_dir: Path) -> None:
-    """openJiuwen по умолчанию пишет подробные логи в ./logs — оставляем только ошибки в консоль."""
+    """openJiuwen по умолчанию пишет подробные логи в ./logs (а в них — тексты запросов).
+
+    Каталог /app в контейнере доступен только для чтения, поэтому файловый вывод выключаем,
+    а в консоль оставляем только критические сообщения: о сбоях вызовов харнесс сообщает сам.
+    """
     try:
         from openjiuwen.core.common.logging.log_config import configure_log_config
 
         configure_log_config({
             "backend": "default",
-            "level": "ERROR",
+            "level": "CRITICAL",
             "log_path": str(log_dir) + "/",
             "output": ["console"],
             "interface_output": ["console"],

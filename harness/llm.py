@@ -138,7 +138,7 @@ class LLMHub:
         self._alt_base_tried = False
         self.unavailable_models: set[str] = set()
         self.on_call: Optional[Callable[[CallRecord], None]] = None
-        self.give_up_after_s = 240.0
+        self.give_up_after_s = cfg.give_up_after_s
         self.token_ratio = 1.0  # поправка грубой оценки токенов по фактическому usage (обновляет оценщик)
 
     # ------------------------------------------------------------------ модель openJiuwen

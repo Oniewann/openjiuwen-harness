@@ -69,8 +69,9 @@ class Config:
     fastpath: bool = True
     crosscheck: bool = True
     # Платная перепроверка ответа второй дешёвой моделью, когда бесплатной сверки нет:
-    # never | auto (только при сомнительных признаках) | always
-    verify: str = "auto"
+    # never | auto (только при сомнительных признаках) | always.
+    # Баллы важнее токенов, а таких задач при включённых навыках единицы — проверяем всегда.
+    verify: str = "always"
     enable_react: bool = True                   # запасной ReAct-агент openJiuwen
 
     # --- лимиты ---
@@ -97,7 +98,8 @@ class Config:
     max_tokens_code: int = 900
     max_tokens_strong: int = 6000
     reasoning_in_completion: bool = True        # считает ли API рассуждения внутри completion_tokens
-    dead_after_failures: int = 6                # столько сбоев подряд — считаем, что бюджет исчерпан
+    dead_after_failures: int = 6                # столько сбоев подряд — прокси, похоже, замолчал: ставим паузы
+    give_up_after_s: float = 240.0              # столько секунд непрерывных сбоев — считаем бюджет исчерпанным
 
     # --- исполнение кода ---
     exec_timeout_s: float = 20.0
@@ -129,7 +131,7 @@ def load_config() -> Config:
 
     cfg.fastpath = _env_bool("HARNESS_FASTPATH", cfg.fastpath)
     cfg.crosscheck = _env_bool("HARNESS_CROSSCHECK", cfg.crosscheck)
-    cfg.verify = (_env("HARNESS_VERIFY", cfg.verify) or "auto").lower()
+    cfg.verify = (_env("HARNESS_VERIFY", cfg.verify) or cfg.verify).lower()
     cfg.enable_react = _env_bool("HARNESS_REACT", cfg.enable_react)
 
     cfg.max_parallel = max(1, min(5, _env_int("HARNESS_PARALLEL", cfg.max_parallel)))
@@ -146,6 +148,10 @@ def load_config() -> Config:
     cfg.task_token_cap = float(_env_float("HARNESS_TASK_CAP", cfg.task_token_cap) or cfg.task_token_cap)
     cfg.react_token_cap = float(_env_float("HARNESS_REACT_CAP", cfg.react_token_cap) or cfg.react_token_cap)
     cfg.reasoning_in_completion = _env_bool("HARNESS_REASONING_IN_COMPLETION", cfg.reasoning_in_completion)
+    cfg.give_up_after_s = float(_env_float("HARNESS_GIVE_UP_AFTER", cfg.give_up_after_s) or cfg.give_up_after_s)
+    cfg.call_timeout_fast = float(_env_float("HARNESS_CALL_TIMEOUT_FAST", cfg.call_timeout_fast) or cfg.call_timeout_fast)
+    cfg.call_timeout_strong = float(_env_float("HARNESS_CALL_TIMEOUT_STRONG", cfg.call_timeout_strong)
+                                    or cfg.call_timeout_strong)
 
     cfg.trace_dir = _env("HARNESS_TRACE_DIR")
     cfg.trace_text = _env_bool("HARNESS_TRACE_TEXT", False)

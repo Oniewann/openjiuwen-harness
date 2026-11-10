@@ -204,7 +204,10 @@ def _startup_error(lines: list[str]) -> str:
 
 
 def _strip_paths(text: str, workspace: Path) -> str:
-    for prefix in {str(workspace), str(Path(workspace).resolve())}:
+    # Сначала самый длинный вариант пути: на macOS /var — ссылка на /private/var, и если убрать
+    # короткий раньше, от полного останется обрывок «/private».
+    prefixes = {str(workspace), str(Path(workspace).resolve())}
+    for prefix in sorted(prefixes, key=len, reverse=True):
         if prefix and prefix != "/":
             text = text.replace(prefix + "/", "")
     return text

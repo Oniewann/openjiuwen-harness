@@ -129,6 +129,39 @@ class SyntheticTest(RepairCase):
         self.assertIn("def smallest(xs):\n    return min(xs)", text)
         self.assertEqual(res.edits, ["mylib.py:2 'min' -> 'max'"])
 
+    def test_upper_instead_of_capitalize_prefers_function_name(self):
+        ws = make_ws("""\
+            def capitalize_words(s):
+                return ' '.join(w.upper() for w in s.split())
+            """, """
+            def test_capitalize_words(self):
+                self.assertEqual(m.capitalize_words('hello big world'), 'Hello Big World')
+            """)
+        self.addCleanup(shutil.rmtree, ws, True)
+        res = self.repair(ws)
+        self.assertTrue(res.fixed, res)
+        self.assertIn("w.capitalize()", (ws / "mylib.py").read_text())
+
+    def test_lost_accumulation_in_loop(self):
+        ws = make_ws("""\
+            def running_total(xs):
+                out = []
+                s = 0
+                for x in xs:
+                    s = x
+                    out.append(s)
+                return out
+            """, """
+            def test_running_total(self):
+                self.assertEqual(m.running_total([1, 2, 3]), [1, 3, 6])
+            """)
+        self.addCleanup(shutil.rmtree, ws, True)
+        res = self.repair(ws)
+        self.assertTrue(res.fixed, res)
+        text = (ws / "mylib.py").read_text()
+        self.assertIn("        s += x\n", text)
+        self.assertIn("    s = 0\n", text)   # присваивание вне цикла не трогаем
+
     def test_two_bugs_in_different_functions(self):
         lib = """\
             def area(w, h):

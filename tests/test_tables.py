@@ -278,9 +278,30 @@ class QuestionTest(_TmpMixin, unittest.TestCase):
         self.assertStatus("How many units of product 'widget' were sold online in months 7 through 8 inclusive?",
                           "unparsed")
 
-    def test_revenue_refused(self):
-        self.assertStatus("What is the total revenue of product 'widget'?", "missing_column")
+    def test_revenue_derived(self):
+        expected = str(sum(r["units"] * r["price"] for r in self.t.rows if r["product"] == "widget"))
+        self.assertOk("What is the total revenue of product 'widget'?", expected)
+        self.assertOk("What is the total revenue (units times price) of product 'widget'?", expected)
+        self.assertStatus("What is the total revenue (units times cost) of product 'widget'?", "missing_column")
         self.assertStatus("How much revenue did product 'widget' generate?", "unparsed")
+
+    def test_missing_column_confirmed_by_preamble(self):
+        res = self.ask(PREAMBLE + "What is the total discount given on product 'widget'?")
+        self.assertEqual((res.status, res.confirmed), ("missing_column", True))
+        res = self.ask("What is the total discount given on product 'widget'?")   # без списка столбцов
+        self.assertEqual((res.status, res.confirmed), ("missing_column", False))
+        res = self.ask(PREAMBLE + "What is the total quantity of product 'widget'?")   # возможный синоним units
+        self.assertFalse(res.confirmed)
+
+    def test_rounding_suffix(self):
+        vals = [r["price"] for r in self.t.rows if r["product"] == "widget"]
+        import math
+        self.assertOk("What is the average price of product 'widget', rounded down to an integer?",
+                      str(math.floor(sum(vals) / len(vals))))
+
+    def test_count_with_number_before_column(self):
+        expected = str(sum(1 for r in self.t.rows if r["product"] == "widget" and r["units"] > 3))
+        self.assertOk("How many orders of product 'widget' have more than 3 units?", expected)
 
     def test_sum_price_refused(self):
         self.assertStatus("What is the total price of product 'widget'?", "unparsed")

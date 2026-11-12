@@ -143,7 +143,9 @@ _CALL_SWAPS = {
     "sum": [("len", 2), ("max", 2), ("min", 2)], "len": [("sum", 2)],
 }
 _METHOD_SWAPS = {
-    "upper": [("lower", 0)], "lower": [("upper", 0)],
+    "upper": [("lower", 0), ("capitalize", 1), ("title", 1)],
+    "lower": [("upper", 0), ("capitalize", 1), ("title", 1)],
+    "casefold": [("upper", 1)], "swapcase": [("upper", 1), ("lower", 1)],
     "startswith": [("endswith", 0)], "endswith": [("startswith", 0)],
     "lstrip": [("rstrip", 0), ("strip", 1)], "rstrip": [("lstrip", 0), ("strip", 1)],
     "strip": [("lstrip", 1), ("rstrip", 1)],
@@ -155,7 +157,8 @@ _METHOD_SWAPS = {
     "keys": [("values", 0)], "values": [("keys", 0)],
     "split": [("rsplit", 0)], "rsplit": [("split", 0)],
     "removeprefix": [("removesuffix", 0)], "removesuffix": [("removeprefix", 0)],
-    "title": [("capitalize", 1)], "capitalize": [("title", 1)],
+    "title": [("capitalize", 1), ("upper", 1), ("lower", 2)],
+    "capitalize": [("title", 1), ("upper", 1), ("lower", 2)],
     "isdigit": [("isalpha", 1)], "isalpha": [("isdigit", 1)],
 }
 _SIMPLE = (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.Constant)
@@ -178,12 +181,14 @@ def _int_const(node: ast.AST) -> Optional[int]:
 class _Gen:
     """Порождает мутанты в заданных узлах одного файла."""
 
-    def __init__(self, rel: str, src: _Src) -> None:
+    def __init__(self, rel: str, src: _Src, expected_exc: tuple[str, ...] = ()) -> None:
         self.rel = rel
         self.src = src
+        self.expected_exc = expected_exc      # исключения, которых ждут тесты (assertRaises)
         self.out: list[_Mut] = []
         self.rank = 0
         self.parents: dict[int, ast.AST] = {}
+        self.fn_name = ""
 
     def emit(self, start: int, end: int, new: str, prio: int) -> None:
         old = self.src.text[start:end]
@@ -213,6 +218,7 @@ class _Gen:
     # -- обход
     def visit_function(self, fn: ast.AST, rank: int) -> None:
         self.rank = rank
+        self.fn_name = getattr(fn, "name", "") or ""
         body = fn.body if hasattr(fn, "body") and isinstance(fn.body, list) else []
         self.parents = {id(c): p for stmt in body for p in ast.walk(stmt) for c in ast.iter_child_nodes(p)}
         for stmt in body:
@@ -225,6 +231,8 @@ class _Gen:
                 self._binop(node)
             elif isinstance(node, ast.AugAssign):
                 self._augassign(node)
+            elif isinstance(node, ast.Assign):
+                self._assign(node)
             elif isinstance(node, ast.Compare):
                 self._compare(node)
             elif isinstance(node, ast.BoolOp):
@@ -239,6 +247,8 @@ class _Gen:
                 self._subscript(node)
             elif isinstance(node, ast.Return) and node.value is not None:
                 self._return(node)
+            elif isinstance(node, ast.Raise) and node.exc is not None:
+                self._raise(node)
             if isinstance(node, (ast.If, ast.While, ast.IfExp)):
                 self._negate(node.test)
             elif isinstance(node, ast.comprehension):
@@ -272,6 +282,30 @@ class _Gen:
         s, e = hits[0]
         for op, prio in swaps:
             self.emit(s, e, _BIN_TXT[op] + "=", prio)
+        self.emit(s, e, "=", 2)   # лишнее накопление: «s += x» вместо «s = x»
+
+    def _assign(self, node: ast.Assign) -> None:
+        """Потерянное накопление в цикле: «s = x» вместо «s += x»."""
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            return
+        parent = self.parents.get(id(node))
+        in_loop = False
+        while parent is not None:
+            if isinstance(parent, (ast.For, ast.While)):
+                in_loop = True
+                break
+            parent = self.parents.get(id(parent))
+        if not in_loop:
+            return
+        a = self.src.span(node.targets[0])[1]
+        b = self.src.span(node.value)[0]
+        hits = self.find_between(a, b, r"(?<![=!<>])=(?!=)")
+        if len(hits) != 1:
+            return
+        s, e = hits[0]
+        self.emit(s, e, "+=", 1)
+        for op in ("-=", "*="):
+            self.emit(s, e, op, 2)
 
     def _compare(self, node: ast.Compare) -> None:
         left = node.left
@@ -337,6 +371,9 @@ class _Gen:
             s = e - len(f.attr)
             if self.src.text[s:e] == f.attr:
                 for new, prio in _METHOD_SWAPS[f.attr]:
+                    # имя функции подсказывает задуманный метод: capitalize_words -> .capitalize()
+                    if prio and new in self.fn_name.lower():
+                        prio -= 1
                     self.emit(s, e, new, prio)
         if isinstance(f, ast.Name) and f.id == "range" and not node.keywords:
             args = node.args
@@ -398,6 +435,16 @@ class _Gen:
             if c in (0, -1):
                 s, e = self.src.span(sl)
                 self.emit(s, e, "-1" if c == 0 else "0", 2)
+
+    def _raise(self, node: ast.Raise) -> None:
+        """«raise TypeError(...)», а тесты ждут ValueError: подставляем ожидаемый класс."""
+        target = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if not isinstance(target, ast.Name):
+            return
+        s, e = self.src.span(target)
+        for name in self.expected_exc:
+            if name != target.id:
+                self.emit(s, e, name, 1)
 
     def _return(self, node: ast.Return) -> None:
         v = node.value
@@ -494,10 +541,23 @@ def _suspects(workspace: Path, texts: dict[str, str], report: TestReport) -> lis
     return picked
 
 
-def _generate(texts: dict[str, str], suspects: list[tuple[str, ast.AST]]) -> list[_Mut]:
+def _expected_exceptions(workspace: Path) -> tuple[str, ...]:
+    names: dict[str, None] = {}
+    for tf in test_files(workspace):
+        try:
+            text = tf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"assertRaises(?:Regex)?\(\s*([A-Za-z_]\w*)|pytest\.raises\(\s*([A-Za-z_]\w*)", text):
+            names.setdefault(m.group(1) or m.group(2))
+    return tuple(n for n in names if n not in ("Exception", "BaseException"))
+
+
+def _generate(texts: dict[str, str], suspects: list[tuple[str, ast.AST]],
+              expected_exc: tuple[str, ...] = ()) -> list[_Mut]:
     gens: dict[str, _Gen] = {}
     for rank, (rel, node) in enumerate(suspects):
-        gen = gens.setdefault(rel, _Gen(rel, _Src(texts[rel])))
+        gen = gens.setdefault(rel, _Gen(rel, _Src(texts[rel]), expected_exc))
         gen.visit_function(node, rank)
     muts = [m for g in gens.values() for m in g.out]
     muts.sort(key=lambda m: (m.priority, m.rank, m.file, m.start, m.end, m.new))
@@ -646,6 +706,7 @@ def mutation_repair(workspace: Path, argv: Optional[list[str]] = None,
             return False
         return set(rep.failed) < cur_fail
 
+    expected_exc = _expected_exceptions(workspace)
     runner = _Runner(workspace, argv, test_timeout, deadline, texts)
     try:
         while time.monotonic() < deadline:
@@ -666,7 +727,7 @@ def mutation_repair(workspace: Path, argv: Optional[list[str]] = None,
             carry = []
             # 2) полный перебор по приоритетам
             if chosen is None:
-                muts = _generate(texts, _suspects(workspace, texts, cur_report))
+                muts = _generate(texts, _suspects(workspace, texts, cur_report), expected_exc)
                 for prio in (0, 1, 2):
                     cands = [m for m in muts if m.priority == prio]
                     reps = runner.evaluate(cands)

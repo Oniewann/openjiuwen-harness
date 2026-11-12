@@ -5,8 +5,9 @@ FROM python:3.12.14-slim-bookworm
 WORKDIR /app
 
 # Зависимости ставятся при сборке; при запуске ничего не скачивается.
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.txt
+# requirements.txt — прямые зависимости, constraints.txt — замок всех транзитивных версий.
+COPY requirements.txt constraints.txt /app/
+RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.txt -c /app/constraints.txt
 
 COPY run_agent.py /app/run_agent.py
 COPY harness /app/harness

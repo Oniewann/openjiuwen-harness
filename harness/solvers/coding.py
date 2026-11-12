@@ -52,6 +52,10 @@ class CodingSolver(Solver):
         self.current: dict[Path, str] = {}       # лучшее на данный момент состояние исходников
         self.report = None
         self.repair_tried = False
+        self.reference_tried = False
+        self.provisional = False                 # правка перебором записана, но ещё не сверена с моделью
+        self.pre_mutation: Optional[tuple[dict, object]] = None   # (исходники, отчёт) до перебора мутаций
+        self.partial: Optional[dict] = None      # частичная правка перебором: запасная основа, модели не показывается
 
     # ------------------------------------------------------------------ 0 токенов
     def prepare(self) -> None:
@@ -65,7 +69,9 @@ class CodingSolver(Solver):
         self.sources = TR.source_files(self.ws)
         if not self.tests or not self.sources:
             what = "no test files" if not self.tests else "no source files to fix"
-            self.mark_static_infeasible(0.6, what)
+            # Нет тестов — нечего ни запускать, ни чинить: задачу нельзя проверить, токены не тратим.
+            # Нет исходников при живых тестах — агент ещё может написать модуль по тестам.
+            self.mark_static_infeasible(0.97 if not self.tests else 0.6, what)
             self.ladder = ("react",)
             return
         self.argv = TR.find_test_command(self.task.instruction, self.ws)
@@ -81,29 +87,71 @@ class CodingSolver(Solver):
                 pass
         self.current = dict(self.original)
         self.report = TR.run_tests(self.ws, self.argv, self.cfg.test_timeout_s)
+        if self.report.ok and self.report.total == 0:
+            # Команда из условия завершилась успешно, не выполнив ни одного теста (в файле нет
+            # unittest.main() или тесты — голые функции). Запускаем тесты так, чтобы они действительно шли.
+            alt = TR.fallback_test_command(self.ws)
+            if alt:
+                again = TR.run_tests(self.ws, alt, self.cfg.test_timeout_s)
+                if again.total > 0 or not again.ok:
+                    self.argv, self.report = alt, again
+                    self.note("tests_rerun", why="the command from the instruction ran no tests")
         self.note("tests", failed=list(self.report.failed), total=self.report.total, error=self.report.error[:120])
         if self.report.ok:
             self._accept("tests already pass")
             return
         try:
-            conflicts = TR.contradictory_asserts(self.ws)
+            conflicts = TR.unsatisfiable_tests(self.ws) or TR.contradictory_asserts(self.ws)
         except Exception:  # noqa: BLE001
             conflicts = []
         if conflicts:
             # Никакая реализация не пройдёт оба теста: токены тратить не на что.
-            self.mark_static_infeasible(0.98, "contradictory tests: " + conflicts[0][:200])
+            self.mark_static_infeasible(0.98, "tests cannot pass: " + conflicts[0][:200])
             self.status = "infeasible"
             return
         if self.cfg.fastpath:
-            self._mutation_repair()
+            if not self._reference_repair():
+                self._mutation_repair(allow_provisional=True)
+
+    def _reference_repair(self) -> bool:
+        """Сломанные функции с известными именами заменяются эталонами (0 токенов, устойчиво к скрытым тестам)."""
+        if self.reference_tried or self.report is None or self.report.ok:
+            return False
+        self.reference_tried = True
+        try:
+            from ..skills.semantic import reference_repair
+
+            self._write(self.current)
+            result = reference_repair(self.ws, self.argv, self.report, test_timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            self.note("reference_repair", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            return False
+        if not result.texts or result.report is None:
+            if result.confirmed:
+                self.note("reference_repair", replaced=[], confirmed=result.confirmed[:12])
+            return False
+        candidate = dict(self.current)
+        candidate.update({self.ws / rel: text for rel, text in result.texts.items() if (self.ws / rel) in self.current})
+        report = self._try(candidate)
+        self.note("reference_repair", replaced=result.replaced[:12], confirmed=result.confirmed[:12], ok=report.ok,
+                  still_failing=list(report.failed)[:8])
+        if report.ok:
+            self.current, self.report = candidate, report
+            self._accept("reference implementations")
+            return True
+        if not report.error and not report.timed_out and (self.report.error or set(report.failed) < set(self.report.failed)):
+            self.current, self.report = candidate, report
+        else:
+            self._write(self.current)
+        return False
 
     def _accept(self, how: str) -> None:
         self.best = self.task.sentinel or "DONE"
         self.status = "verified"
         self.note("accept", how=how)
 
-    def _mutation_repair(self) -> bool:
-        """Бесплатный ремонт перебором мутаций от исходного состояния."""
+    def _mutation_repair(self, allow_provisional: bool = False) -> bool:
+        """Бесплатный ремонт перебором мутаций от лучшего на данный момент состояния."""
         if self.repair_tried:
             return False
         self.repair_tried = True
@@ -111,7 +159,8 @@ class CodingSolver(Solver):
             from ..skills.repair import mutation_repair
         except Exception:  # noqa: BLE001 — модуль навыка недоступен
             return False
-        self._write(self.original)
+        self._write(self.current)
+        self.pre_mutation = (dict(self.current), self.report)
         try:
             result = mutation_repair(self.ws, self.argv, time_budget=40.0, test_timeout=5.0)
         except Exception as exc:  # noqa: BLE001
@@ -125,7 +174,16 @@ class CodingSolver(Solver):
         if result.fixed:
             self.current = self._read_sources()
             self.report = result.report
-            self._accept("mutation repair")
+            if allow_provisional and result.edits and self.cfg.code_crosscheck and self.cfg.base_url:
+                # Тесты проходят, ответ уже можно записать. Но правка подобрана под видимые тесты:
+                # одной дешёвой попыткой модели проверяем, не подгонка ли это (см. skills/semantic.py).
+                self.provisional = True
+                self.best = self.task.sentinel or "DONE"
+                self.status = "answered"
+                self.ladder = ("fast",)
+                self.note("accept_provisional", how="mutation repair; waiting for the model cross-check")
+            else:
+                self._accept("mutation repair")
             return True
         self._write(self.current)
         self._keep_partial(result)
@@ -139,15 +197,17 @@ class CodingSolver(Solver):
                    if (self.ws / rel) in self.original}
         if not partial or self.report is None:
             return
-        candidate = dict(self.original)
+        candidate = dict(self.current)
         candidate.update(partial)
         report = self._try(candidate)
         better = not report.error and not report.timed_out and set(report.failed) < set(self.report.failed)
         if better and len(report.failed) < len(self.report.failed):
-            self.current, self.report = candidate, report
+            # Правка подобрана под видимые тесты и может быть подгонкой, поэтому основой для модели её
+            # не делаем: модель увидит исходный код и все упавшие тесты. Частичная правка пригодится,
+            # только если версия модели сама тесты не пройдёт.
+            self.partial = candidate
             self.note("repair_partial", still_failing=list(report.failed))
-        else:
-            self._write(self.current)
+        self._write(self.current)
 
     # ------------------------------------------------------------------ файлы
     def _read_sources(self) -> dict[Path, str]:
@@ -180,10 +240,10 @@ class CodingSolver(Solver):
         return str(path.relative_to(self.ws))
 
     # ------------------------------------------------------------------ промпт
-    def _sources_text(self) -> str:
+    def _sources_text(self, texts: Optional[dict] = None) -> str:
         parts = []
         for path in self.sources:
-            text = self.current.get(path, "")
+            text = (texts or self.current).get(path, "")
             if len(text) > _MAX_SOURCE_CHARS:
                 text = text[:_MAX_SOURCE_CHARS] + "\n# ... (file truncated)\n"
             parts.append(f"# file: {self._rel(path)}\n{text.rstrip()}")
@@ -246,7 +306,8 @@ class CodingSolver(Solver):
     def last_resort(self) -> None:
         """Модель недоступна или не справилась, а перебор мутаций ещё не пробовали — пробуем."""
         if self.status == "pending" and self.report is not None and not self.report.ok and self.cfg.crosscheck:
-            self._mutation_repair()
+            if not self._reference_repair():
+                self._mutation_repair()
 
     def finalize(self) -> None:
         if self.status == "pending":
@@ -271,9 +332,90 @@ class CodingSolver(Solver):
         except LLMError as exc:
             return Outcome("infra", note=str(exc))
 
+    async def _llm_crosscheck(self, step: str) -> Outcome:
+        """Правка перебором уже записана и проходит тесты. Модель чинит исходное состояние независимо:
+        её версия, если проходит те же тесты, заменяет подобранную мутацию (модель понимает смысл функции
+        по имени, перебор — нет). Любой сбой оставляет правку перебором."""
+        from ..skills.testrun import summarize_failures
+
+        done = Outcome("answer", answer=self.task.sentinel or "DONE")
+        base_texts, base_report = self.pre_mutation or (self.original, None)
+        failures = summarize_failures(base_report, 1500) if base_report is not None else "(tests were not run)"
+        prompt = f"{self._sources_text(base_texts)}\n\nFailing tests:\n{failures}"
+        if len(self.sources) > 1:
+            prompt += "\n\nStart each code block with a line `# file: <name>`."
+        messages = [{"role": "system", "content": CODING_SYSTEM}, {"role": "user", "content": prompt}]
+        self.env.estimator.remember_prediction(self.task.task_id, step, self.family, self.features())
+        with self.env.hub.scope(self.task.task_id, self.family, step, cap=self.cfg.task_token_cap):
+            reply = await self.env.hub.chat(messages, role="fast", max_tokens=self.cfg.max_tokens_code, temperature=0.0)
+        self.note(step, model=reply.model, cost=round(reply.cost, 1), prompt_tokens=reply.prompt_tokens,
+                  completion_tokens=reply.completion_tokens, reasoning_tokens=reply.reasoning_tokens,
+                  finish=reply.finish_reason, crosscheck=True,
+                  **({"reply": reply.text[:800]} if self.env.trace_text else {}))
+        if is_refusal(reply.text):
+            self.note("crosscheck", used="mutation", why="model refused")
+            return done
+        files = {self._rel(p): text for p, text in base_texts.items()}
+        patches = split_by_file(reply.text, files)
+        candidate = dict(base_texts)
+        applied = 0
+        for path in self.sources:
+            patch = patches.get(self._rel(path))
+            if not patch:
+                continue
+            patched = apply_patch(base_texts.get(path, ""), patch)
+            if patched is not None and patched != base_texts.get(path):
+                candidate[path] = patched
+                applied += 1
+        if not applied:
+            self.note("crosscheck", used="mutation", why="no applicable patch")
+            return done
+        report = await asyncio.to_thread(self._try_in_copy, candidate)
+        if report is None or not report.ok:
+            self.note("crosscheck", used="mutation", why="the model's version fails the tests")
+            return done
+        differs = None
+        try:
+            from ..skills.semantic import behavior_diff
+
+            differs = await asyncio.to_thread(
+                behavior_diff, self.ws, {self._rel(p): t for p, t in self.current.items()},
+                {self._rel(p): t for p, t in candidate.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        if differs == []:
+            self.note("crosscheck", used="mutation", agree=True)
+            return done
+        await asyncio.to_thread(self._write, candidate)
+        self.current, self.report = candidate, report
+        self.note("crosscheck", used="model", agree=False if differs else None, differs=(differs or [])[:8])
+        return done
+
+    def _try_in_copy(self, texts: dict[Path, str]):
+        """Проверка кандидата в копии каталога: сам workspace не меняется (в нём лежит рабочая правка)."""
+        import tempfile
+
+        from ..skills import testrun as TR
+
+        tmp = Path(tempfile.mkdtemp(prefix="xcheck_"))
+        try:
+            work = tmp / "ws"
+            shutil.copytree(self.ws, work, symlinks=True, ignore=shutil.ignore_patterns("__pycache__", "answer.txt"))
+            for path, text in texts.items():
+                (work / path.relative_to(self.ws)).write_text(text, encoding="utf-8")
+            for path, data in self.test_bytes.items():
+                (work / path.relative_to(self.ws)).write_bytes(data)
+            return TR.run_tests(work, self.argv, self.cfg.test_timeout_s)
+        except OSError:
+            return None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     async def _llm_fix(self, step: str) -> Outcome:
         from ..skills import testrun as TR
 
+        if self.provisional:
+            return await self._llm_crosscheck(step)
         role = ROLE_OF_STEP.get(step, "fast")
         strong = role == "strong"
         messages = [{"role": "system", "content": CODING_SYSTEM},
@@ -310,6 +452,19 @@ class CodingSolver(Solver):
             if report.ok:
                 self.current, self.report = candidate, report
                 return Outcome("answer", answer=self.task.sentinel or "DONE")
+            if self.partial is not None:
+                # правка модели поверх частичной правки перебором: вместе они могут закрыть все тесты
+                combined = dict(self.partial)
+                for path in self.sources:
+                    patch = patches.get(self._rel(path))
+                    patched = apply_patch(combined.get(path, ""), patch) if patch else None
+                    if patched is not None:
+                        combined[path] = patched
+                both = await asyncio.to_thread(self._try, combined)
+                if both.ok:
+                    self.current, self.report = combined, both
+                    self.note("combined", how="model patch on top of the partial mutation repair")
+                    return Outcome("answer", answer=self.task.sentinel or "DONE")
             improved = (self.report is not None and not report.error and not report.timed_out
                         and set(report.failed) < set(self.report.failed))
             if improved:
@@ -324,7 +479,11 @@ class CodingSolver(Solver):
     async def _free_repair(self, step: str) -> bool:
         """Бесплатная страховка после неудачи модели: если баг — мутация одного оператора,
         перебор найдёт его без токенов (при fastpath он уже был сделан на подготовке)."""
-        if self.repair_tried or not self.cfg.crosscheck:
+        if not self.cfg.crosscheck:
+            return False
+        if not self.reference_tried and await asyncio.to_thread(self._reference_repair):
+            return True
+        if self.repair_tried:
             return False
         return await asyncio.to_thread(self._mutation_repair)
 

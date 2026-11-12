@@ -39,6 +39,7 @@ class TableAnswer:
     answer: Optional[str] = None
     plan: str = ""              # читаемый план вычисления
     detail: str = ""            # почему отказ / пометки
+    confirmed: bool = False     # missing_column: столбца нет и в списке столбцов из условия
 
 
 # ---------------------------------------------------------------- загрузка
@@ -48,7 +49,7 @@ def find_tables(workspace: Path) -> list[Path]:
     workspace = Path(workspace)
     found = []
     for p in workspace.rglob("*"):
-        if not p.is_file() or p.suffix.lower() not in (".csv", ".tsv"):
+        if not p.is_file() or p.suffix.lower() not in (".csv", ".tsv", ".json", ".jsonl", ".ndjson"):
             continue
         rel = p.relative_to(workspace)
         if any(part.startswith(".") for part in rel.parts):
@@ -90,21 +91,26 @@ def load_table(path: Path, max_rows: int = 200_000) -> Table:
     """Читает csv/tsv: определяет разделитель, убирает BOM, приводит числовые столбцы."""
     path = Path(path)
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    delim = _detect_delimiter(text[:8192], path.suffix.lower())
-    reader = csv.reader(io.StringIO(text), delimiter=delim)
-    try:
-        header = [h.strip() for h in next(reader)]
-    except StopIteration:
-        return Table(path, path.name, [], [], {}, {})
-    raw: list[list[str]] = []
-    for rec in reader:
-        if not rec or all(not c.strip() for c in rec):
-            continue
-        rec = [c.strip() for c in rec[: len(header)]]
-        rec += [""] * (len(header) - len(rec))
-        raw.append(rec)
-        if len(raw) >= max_rows:
-            break
+    if path.suffix.lower() in (".json", ".jsonl", ".ndjson"):
+        header, raw = _json_rows(text, max_rows)
+        if not header:
+            return Table(path, path.name, [], [], {}, {})
+    else:
+        delim = _detect_delimiter(text[:8192], path.suffix.lower())
+        reader = csv.reader(io.StringIO(text), delimiter=delim)
+        try:
+            header = [h.strip() for h in next(reader)]
+        except StopIteration:
+            return Table(path, path.name, [], [], {}, {})
+        raw = []
+        for rec in reader:
+            if not rec or all(not c.strip() for c in rec):
+                continue
+            rec = [c.strip() for c in rec[: len(header)]]
+            rec += [""] * (len(header) - len(rec))
+            raw.append(rec)
+            if len(raw) >= max_rows:
+                break
     types: dict[str, str] = {}
     for i, col in enumerate(header):
         types[col] = _column_type([r[i] for r in raw])
@@ -128,6 +134,46 @@ def load_table(path: Path, max_rows: int = 200_000) -> Table:
             if len(vals) <= _DISTINCT_LIMIT:
                 distinct[col] = vals
     return Table(path, path.name, header, rows, types, distinct)
+
+
+def _json_rows(text: str, max_rows: int) -> tuple[list[str], list[list[str]]]:
+    """Список объектов (json) или объект на строку (jsonl) -> заголовок и строки как в csv."""
+    import json
+
+    items: list = []
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            # {"orders": [...]} — берём единственный список объектов внутри
+            lists = [v for v in data.values() if isinstance(v, list) and v and all(isinstance(i, dict) for i in v)]
+            data = lists[0] if len(lists) == 1 else []
+        items = data if isinstance(data, list) else []
+    except ValueError:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                return [], []
+    items = [i for i in items if isinstance(i, dict)][:max_rows]
+    header: dict[str, None] = {}
+    for item in items:
+        for key in item:
+            header.setdefault(str(key))
+    cols = list(header)
+
+    def cell(v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v).lower()
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v).strip()
+
+    return cols, [[cell(item.get(c)) for c in cols] for item in items]
 
 
 def table_summary(table: Table, sample_rows: int = 3) -> str:
@@ -217,7 +263,7 @@ def answer_table_question(table: Table, question: str) -> TableAnswer:
     try:
         return _answer(table, question)
     except _Missing as exc:
-        return TableAnswer("missing_column", detail=str(exc))
+        return TableAnswer("missing_column", detail=str(exc), confirmed=_missing_confirmed(table, question, str(exc)))
     except _Unparsed as exc:
         return TableAnswer("unparsed", detail=str(exc))
 
@@ -246,6 +292,20 @@ def _answer(table: Table, question: str) -> TableAnswer:
     if len(sentences) != 1 or not sentences[0].endswith("?"):
         raise _Unparsed(f"ожидался ровно один вопрос, получено: {sentences!r}")
     q = sentences[0][:-1].strip()
+
+    # Округление результата: «…, rounded down to an integer», «rounded to 2 decimal places».
+    rounding: Optional[tuple[str, int]] = None
+    rm = _ROUND_RE.search(q)
+    if rm:
+        how = (rm.group(1) or "").lower()
+        places = int(rm.group(2)) if rm.group(2) else 0
+        rounding = ({"down": "floor", "up": "ceil"}.get(how, "nearest"), places)
+        q = (q[: rm.start()] + q[rm.end():]).strip(" ,")
+
+    # Производная мера «выручка»: «revenue (units times price)» или просто «revenue»,
+    # если в таблице ровно один столбец количества и ровно один столбец цены.
+    table, q = _with_derived_revenue(table, q, notes)
+    table = _with_date_parts(table, q, notes)
 
     cols_by_key = {_key(c): c for c in table.columns}
 
@@ -310,6 +370,27 @@ def _answer(table: Table, question: str) -> TableAnswer:
         (rf"(\w+) (?:less than|fewer than|below|under|<) {_NUM}", "<"),
         (rf"(\w+) (?:of |= |equal to |equals )?{_NUM}", "=="),
     ]
+    # «orders that have more than 20 units»: число стоит перед столбцом
+    rev_patterns = [
+        (rf"(?:have|has|with|of) (?:at least|>=) {_NUM} (\w+)", ">="),
+        (rf"(?:have|has|with|of) (?:at most|<=) {_NUM} (\w+)", "<="),
+        (rf"(?:have|has|with|of) (?:more than|over|above|greater than|>) {_NUM} (\w+)", ">"),
+        (rf"(?:have|has|with|of) (?:fewer than|less than|under|below|<) {_NUM} (\w+)", "<"),
+        (rf"(?:have|has|with) (?:exactly )?{_NUM} (\w+)", "=="),
+    ]
+    for pat, op in rev_patterns:
+        while True:
+            mm = re.search(r"(?<!\w)" + pat + r"(?!\w)", s)
+            if not mm:
+                break
+            word = mm.group(2)
+            col = lookup(word)
+            if col is None or table.types[col] == "str":
+                break   # пусть разбирают общие правила ниже (или откажут)
+            g = mm.group(1)
+            filters.append((col, op, float(g) if "." in g else int(g)))
+            consume(mm.span())
+
     for pat, op in num_patterns:
         while True:
             mm = re.search(r"(?<!\w)" + pat + r"(?!\w)", s)
@@ -344,11 +425,22 @@ def _answer(table: Table, question: str) -> TableAnswer:
         raise _Unparsed(f"необъяснённые слова: {leftover}")
 
     # --- вычисление
+    # «products 'gadget' and 'sprocket'»: два значения одного столбца — это «любое из», а не «оба сразу»
+    alternatives: dict[str, set] = {}
+    for col, op, v in filters:
+        if op == "==" and isinstance(v, str):
+            alternatives.setdefault(col, set()).add(v)
+    alternatives = {c: vs for c, vs in alternatives.items() if len(vs) > 1}
+
     def ok(row: dict) -> bool:
         for col, op, v in filters:
             x = row.get(col)
             if x is None:
                 return False
+            if op == "==" and col in alternatives:
+                if x not in alternatives[col]:
+                    return False
+                continue
             if op == "==" and not x == v:
                 return False
             if op == ">=" and not x >= v:
@@ -381,7 +473,90 @@ def _answer(table: Table, question: str) -> TableAnswer:
             result = max(vals)
         else:
             result = min(vals)
+    if rounding is not None:
+        result = _apply_rounding(result, *rounding)
+        plan += f" rounded {rounding[0]}" + (f" to {rounding[1]} places" if rounding[1] else "")
+        if rounding[1] > 0:
+            # «rounded to 2 decimal places»: пишем так, как напечатал бы python — print(round(x, 2)) -> 46.0
+            return TableAnswer("ok", answer=repr(round(float(result), rounding[1])), plan=plan, detail="; ".join(notes))
     return TableAnswer("ok", answer=_fmt_number(result), plan=plan, detail="; ".join(notes))
+
+
+_ROUND_RE = re.compile(
+    r",? \(?rounded (?:(down|up) )?(?:to (?:an integer|a whole number|the nearest (?:integer|whole number)|"
+    r"(\d+) decimal places?))?\)?(?=$|,)", re.IGNORECASE)
+_QTY_LIKE = re.compile(r"^(?:units?|qty|quantity|quantities|count|amount_sold|units_sold)$", re.IGNORECASE)
+_REVENUE_RE = re.compile(
+    r"\b(revenue|sales value|turnover)(?: \((\w+) (?:times|\*|x|×|multiplied by) (\w+)\))?", re.IGNORECASE)
+
+
+def _apply_rounding(x: Any, how: str, places: int) -> Any:
+    import math
+    from decimal import Decimal, ROUND_HALF_EVEN
+
+    if isinstance(x, int) and places == 0:
+        return x
+    scale = 10 ** places
+    if how == "floor":
+        v = math.floor(x * scale + 1e-9) / scale
+    elif how == "ceil":
+        v = math.ceil(x * scale - 1e-9) / scale
+    else:
+        d = Decimal(repr(float(x))) * scale
+        if abs(d - d.to_integral_value(ROUND_HALF_EVEN)) == Decimal("0.5"):
+            raise _Unparsed(f"{x} ровно посередине: способ округления неоднозначен")
+        v = round(x, places)
+    return int(v) if places == 0 else v
+
+
+def _with_derived_revenue(table: Table, q: str, notes: list[str]) -> tuple[Table, str]:
+    m = _REVENUE_RE.search(q)
+    if not m or any(_key(c) == _key(m.group(1)) for c in table.columns):
+        return table, q
+    by_key = {_key(c): c for c in table.columns}
+    if m.group(2):
+        a, b = by_key.get(_key(m.group(2))), by_key.get(_key(m.group(3)))
+        if a is None or b is None:
+            raise _Missing(f"no column for revenue formula {m.group(0)!r}; columns: {table.columns}")
+    else:
+        qty = [c for c in table.columns if _QTY_LIKE.match(_key(c)) and table.types[c] != "str"]
+        price = [c for c in table.columns if _PRICE_LIKE.search(_key(c)) and table.types[c] != "str"]
+        if len(qty) != 1 or len(price) != 1:
+            raise _Unparsed(f"не ясно, из чего считать выручку: количество {qty}, цена {price}")
+        a, b = qty[0], price[0]
+    if table.types[a] == "str" or table.types[b] == "str":
+        raise _Unparsed(f"выручка из нечислового столбца {a} или {b}")
+    name = "revenue"
+    rows = [dict(r, **{name: (r[a] * r[b] if r.get(a) is not None and r.get(b) is not None else None)})
+            for r in table.rows]
+    kind = "int" if table.types[a] == table.types[b] == "int" else "float"
+    derived = Table(table.path, table.name, table.columns + [name], rows, dict(table.types, **{name: kind}),
+                    table.distinct)
+    notes.append(f"revenue = {a} * {b}")
+    return derived, q[: m.start()] + name + q[m.end():]
+
+
+_DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T].*)?$")
+
+
+def _with_date_parts(table: Table, q: str, notes: list[str]) -> Table:
+    """В вопросе «months 6 through 9», а в таблице только дата 2024-06-15: добавляем month/year/day."""
+    wanted = [w for w in ("month", "year", "day") if re.search(rf"\b{w}s?\b", q, re.IGNORECASE)
+              and not any(_key(c) in (w, w + "s") for c in table.columns)]
+    if not wanted or not table.rows:
+        return table
+    date_cols = [c for c in table.columns if table.types.get(c) == "str"
+                 and all(_DATE_RE.match(str(r[c])) for r in table.rows)]
+    if len(date_cols) != 1:
+        return table
+    col = date_cols[0]
+    rows = []
+    for r in table.rows:
+        y, mth, d = (int(g) for g in _DATE_RE.match(str(r[col])).groups())
+        rows.append(dict(r, **{w: {"year": y, "month": mth, "day": d}[w] for w in wanted}))
+    notes.append(f"{', '.join(wanted)} derived from {col}")
+    return Table(table.path, table.name, table.columns + wanted, rows,
+                 dict(table.types, **{w: "int" for w in wanted}), table.distinct)
 
 
 def _coerce_filter_value(table: Table, col: str, val: str, notes: list[str]) -> Any:
@@ -437,6 +612,11 @@ def _parse_measure(table: Table, s: str, lookup) -> tuple[str, Optional[str], st
             return ("count", None, s[:mm.start()] + " " + s[mm.end():])
         if word in _FILLER or word in _AGG_WORDS or word in _HOW_MANY_NOT_COLUMN:
             raise _Unparsed(f"не понята мера после «how many {word}»")
+        stem = word[:-1] if word.endswith("s") else word
+        entity_cols = {stem + "_id", stem + "id", stem + "_name", stem + "_no", stem + "_number"}
+        if any(_key(c) in entity_cols for c in table.columns) or Path(table.name).stem.lower() in (word, stem):
+            # строки таблицы и есть эти объекты: employees.csv / employee_id -> «how many employees» = число строк
+            return ("count", None, s[:mm.start()] + " " + s[mm.end():])
         raise _Missing(f"no column {word!r} for 'how many'; columns: {table.columns}")
 
     # «What is the total/average/maximum <col>», «sum of <col>»
@@ -476,3 +656,28 @@ def _plan_text(agg: str, col: Optional[str], filters: list[tuple[str, str, Any]]
                 continue
         parts.append(f"{c} {op} {_fmt_value(v)}")
     return head + (" where " + " and ".join(parts) if parts else "")
+
+
+# Слова, которыми в вопросе могут назвать существующий столбец или вычислимую величину:
+# по ним «нет столбца» ещё не значит «задача невыполнима».
+_COLUMN_SYNONYMS = {
+    "quantity", "quantities", "qty", "items", "item", "pieces", "piece", "amount", "amounts", "cost", "costs",
+    "revenue", "sales", "sale", "value", "values", "total", "count", "number", "orders", "order", "money",
+    "income", "earnings", "turnover", "spend", "spending", "volume",
+}
+
+
+def _missing_confirmed(table: Table, question: str, detail: str) -> bool:
+    """Столбца нет в файле, и условие само перечисляет столбцы — без него."""
+    m = re.search(r"no column '([^']+)'", detail)
+    pm = _PREAMBLE_RE.search(re.sub(r"\s+", " ", question or ""))
+    if not m or not pm:
+        return False
+    word = m.group(1).lower()
+    listed = {_key(c) for c in re.split(r"[,;]", pm.group(2)) if c.strip()}
+    if listed != {_key(c) for c in table.columns}:
+        return False   # условие и файл расходятся — не берёмся судить
+    stems = {word, word.rstrip("s"), word[:-2] if word.endswith("es") else word}
+    if stems & _COLUMN_SYNONYMS or stems & listed:
+        return False
+    return True

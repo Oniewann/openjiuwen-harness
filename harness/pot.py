@@ -75,11 +75,17 @@ try:
     except SyntaxError:
         __compiled = compile(__code, "<answer>", "exec")
         __mode = "exec"
+    import io, contextlib
+    __buf = io.StringIO()
     if __mode == "eval":
-        __val = eval(__compiled, globals())
+        # «print(expr)» — тоже выражение: его значение None, а ответ уходит в stdout. Перехватываем и его.
+        with contextlib.redirect_stdout(__buf):
+            __val = eval(__compiled, globals())
+        if __val is None:
+            __lines = [ln for ln in __buf.getvalue().splitlines() if ln.strip()]
+            if __lines:
+                __val = __lines[-1].strip()
     else:
-        import io, contextlib
-        __buf = io.StringIO()
         with contextlib.redirect_stdout(__buf):
             exec(__compiled, globals())
         __lines = [ln for ln in __buf.getvalue().splitlines() if ln.strip()]

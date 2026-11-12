@@ -43,6 +43,9 @@ class MathSolver(ExprSolver):
         if result is not None:
             if result.status == "ok" and result.answer is not None:
                 self.accept_skill(result.answer, result.expression)
+            elif result.status == "infeasible":
+                # условие разобрано целиком, но числа для ответа в нём нет (или деление на ноль)
+                self.mark_static_infeasible(0.97, result.detail)
             elif result.status == "error":
                 self.mark_static_infeasible(0.8, result.detail or "arithmetic error in the problem")
         self.prepared = True
@@ -70,14 +73,24 @@ class DataSolver(ExprSolver):
         self.tables = []
         self.main = None
         paths = _safe(T.find_tables, self.task.workspace, default=[]) if self.task.has_workspace else []
-        mentioned = re.findall(r"[\w\-./]+\.(?:csv|tsv)", self.task.instruction)
+        mentioned = re.findall(r"[\w\-./]+\.(?:csv|tsv|jsonl|ndjson|json|xlsx|xls|txt|db|sqlite)\b", self.task.instruction)
+        mentioned = [m for m in mentioned if Path(m).name != "answer.txt"]
         for path in paths[:8]:
             table = _safe(T.load_table, path)
             if table is not None and table.columns:
                 self.tables.append(table)
         if not self.tables:
             what = f"file {mentioned[0]} is missing" if mentioned else "no data file in the workspace"
-            self.mark_static_infeasible(0.97, what)
+            # Данные могут лежать в формате, который навык не читает (xlsx, sqlite, свой текст): тогда это
+            # не «данных нет», а работа для модели с bash. Уверенный отказ — только если такого файла нет.
+            other = [p for p in self.task.workspace.rglob("*")
+                     if p.is_file() and not p.name.startswith(".") and p.name != "answer.txt"
+                     and (p.suffix.lower() in (".xlsx", ".xls", ".db", ".sqlite", ".sqlite3", ".parquet", ".dat", ".xml")
+                          or (mentioned and p.name == Path(mentioned[0]).name and p.stat().st_size > 0))
+                     ] if self.task.has_workspace else []
+            self.mark_static_infeasible(0.6 if other else 0.97, what)
+            if other:
+                self.ladder = ("react",)
             self.prepared = True
             return
         by_name = {t.name: t for t in self.tables}
@@ -89,7 +102,11 @@ class DataSolver(ExprSolver):
             if result.status == "ok" and result.answer is not None:
                 self.accept_skill(result.answer, result.plan)
             elif result.status == "missing_column":
-                self.mark_static_infeasible(0.7, result.detail)
+                # 0.97 — столбца нет ни в файле, ни в списке столбцов из самого условия, и слово не похоже
+                # на другое название существующего столбца; иначе решает модель.
+                # 0.9, а не 0.97: формулировки в финале будут другими, столбец могут назвать иначе.
+                # Одна дешёвая попытка модели (~40 токенов) дешевле потерянной задачи; её отказ закрывает задачу.
+                self.mark_static_infeasible(0.9 if result.confirmed else 0.7, result.detail)
         self.prepared = True
 
     def features(self) -> dict:
@@ -128,8 +145,10 @@ class SearchSolver(ExprSolver):
     system_prompt = (
         "`kb` is a dict loaded from the knowledge base: kb[title] is a dict of that entry's fields; "
         "a field value that equals another title links to that entry. Reply with ONLY one Python expression "
-        "that evaluates to the final answer. " + _ONLY_CODE + " "
-        "If kb does not contain what is asked, reply NOT_FOUND."
+        "that evaluates to the final answer itself: a name, a number, or 'yes'/'no' - never True/False "
+        "unless asked. You may filter, count, compare and take min/max over kb.items() (for example, "
+        "the employees of a company are the entries whose Employer is that company). " + _ONLY_CODE + " "
+        "Reply NOT_FOUND only if the entry or the field that the question needs is absent from kb."
     )
     direct_prompt = (
         "Answer the question using only the passages below. Reply with ONLY the answer (a name, number or "
@@ -155,10 +174,16 @@ class SearchSolver(ExprSolver):
             self.mark_static_infeasible(0.97, "knowledge base is empty")
             self.prepared = True
             return
+        self.query = _safe(K.canonicalize_question, self.kb, self.query, default=self.query)
         self.anchors = K.find_mentions(self.kb, self.query)
         self.direct = not self.kb.structured
         if not self.direct:
             result = _safe(K.answer_path_question, self.kb, self.query)
+            if result is not None and result.status == "unparsed":
+                # не цепочка — может быть сравнение («кто старше») или обратная ссылка («кого наставляет»)
+                other = _safe(K.answer_relation_question, self.kb, self.query)
+                if other is not None and other.status != "unparsed":
+                    result = other
             if result is not None:
                 if result.ok and result.answer:
                     self.accept_skill(result.answer, " > ".join([result.anchor or "?"] + result.chain))

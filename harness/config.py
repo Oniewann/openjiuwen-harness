@@ -72,6 +72,9 @@ class Config:
     # never | auto (только при сомнительных признаках) | always.
     # Баллы важнее токенов, а таких задач при включённых навыках единицы — проверяем всегда.
     verify: str = "always"
+    # coding: правку, найденную перебором мутаций, сверять одной дешёвой попыткой модели
+    # (перебор подгоняет код под видимые тесты; скрытые тесты могут быть шире).
+    code_crosscheck: bool = True
     enable_react: bool = True                   # запасной ReAct-агент openJiuwen
 
     # --- лимиты ---
@@ -132,6 +135,7 @@ def load_config() -> Config:
     cfg.fastpath = _env_bool("HARNESS_FASTPATH", cfg.fastpath)
     cfg.crosscheck = _env_bool("HARNESS_CROSSCHECK", cfg.crosscheck)
     cfg.verify = (_env("HARNESS_VERIFY", cfg.verify) or cfg.verify).lower()
+    cfg.code_crosscheck = _env_bool("HARNESS_CODE_CROSSCHECK", cfg.code_crosscheck)
     cfg.enable_react = _env_bool("HARNESS_REACT", cfg.enable_react)
 
     cfg.max_parallel = max(1, min(5, _env_int("HARNESS_PARALLEL", cfg.max_parallel)))

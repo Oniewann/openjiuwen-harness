@@ -19,8 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-_FIELD_RE = re.compile(r"^\s*[-*]?\s*\**([A-Za-z][\w \-/]{0,40}?)\**\s*:\s*(.+?)\s*$")
-_TEXT_SUFFIXES = (".md", ".txt", ".markdown")
+_FIELD_RE = re.compile(r"^\s*[-*+]?\s*([A-Za-z][\w \-/]{0,40}?)\s*(?::|=|\|)\s*(.+?)\s*\|?\s*$")
+_EMPHASIS_RE = re.compile(r"\*\*|__|`")           # **Born:** 1983, `Born`: 1983
+_TEXT_SUFFIXES = (".md", ".txt", ".markdown", ".json", ".yaml", ".yml", ".rst", ".text", "")
+_TITLE_KEYS = ("name", "title", "full name", "full_name", "entity", "id")
+# Значения, которые означают «данных нет»
+_NO_VALUE = {"unknown", "n/a", "na", "?", "tbd", "none", "-", "--", "null", "not available", "not known", "missing",
+             "unspecified", "undisclosed", "not specified", "n.a."}
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+|'s|’s|[^\sA-Za-z0-9_]")
 
 # Слова, которые в вопросе-цепочке ничего не значат (вопросительные, служебные, тип ответа).
@@ -46,6 +51,7 @@ class KB:
     files: dict[str, str] = field(default_factory=dict)                # название -> файл
     texts: dict[str, str] = field(default_factory=dict)                # название -> исходный текст
     duplicates: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)                # повторы с другим содержимым
     total_chars: int = 0
 
     @property
@@ -107,28 +113,80 @@ def load_kb(kb_dir: Path, max_files: int = 5000) -> KB:
         except OSError:
             continue
         kb.total_chars += len(text)
-        title: Optional[str] = None
-        fields: dict[str, Any] = {}
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
+        if "\x00" in text[:2000]:
+            continue                      # двоичный файл
+        records: list[tuple[Optional[str], dict[str, Any]]] = []
+        if path.suffix.lower() == ".json":
+            records = _json_records(text)
+        if not records:
+            title: Optional[str] = None
+            fields: dict[str, Any] = {}
+            for line in text.splitlines():
+                stripped = _EMPHASIS_RE.sub("", line).strip()
+                if not stripped or stripped in ("---", "..."):
+                    continue
+                if title is None and stripped.startswith("#"):
+                    title = stripped.lstrip("#").strip()
+                    continue
+                m = _FIELD_RE.match(stripped.strip("|").strip())
+                if m:
+                    fields.setdefault(m.group(1).strip(), _convert(m.group(2).strip().strip('"').strip("'")))
+            records = [(title, fields)]
+        for title, fields in records:
+            if not title:
+                # заголовка нет: имя записи берём из поля name/title, иначе из имени файла
+                key = next((k for k in fields if k.lower() in _TITLE_KEYS and isinstance(fields[k], str)), None)
+                if key is not None:
+                    title = str(fields.pop(key)).strip()
+            if not title:
+                stem = re.sub(r"^(person|company|org|entity|doc)[_\-]", "", path.stem)
+                title = stem.replace("_", " ").replace("-", " ").strip().title()
+            if title in kb.entries:
+                kb.duplicates.append(title)
+                if kb.entries[title] != fields:
+                    kb.conflicts.append(title)
                 continue
-            if title is None and stripped.startswith("#"):
-                title = stripped.lstrip("#").strip()
-                continue
-            m = _FIELD_RE.match(stripped)
-            if m:
-                fields.setdefault(m.group(1).strip(), _convert(m.group(2)))
-        if not title:
-            stem = re.sub(r"^(person|company|org|entity|doc)[_\-]", "", path.stem)
-            title = stem.replace("_", " ").replace("-", " ").strip().title()
-        if title in kb.entries:
-            kb.duplicates.append(title)
-            continue
-        kb.entries[title] = fields
-        kb.files[title] = str(path.relative_to(kb_dir))
-        kb.texts[title] = text
+            kb.entries[title] = fields
+            kb.files[title] = str(path.relative_to(kb_dir))
+            kb.texts[title] = text
+    _relink_titles(kb)
     return kb
+
+
+def _json_records(text: str) -> list[tuple[Optional[str], dict[str, Any]]]:
+    """Записи из json-файла: объект — одна запись, список объектов — несколько."""
+    import json
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    items = data if isinstance(data, list) else [data]
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fields = {str(k): (_convert(v) if isinstance(v, str) else v) for k, v in item.items()
+                  if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+        key = next((k for k in fields if k.lower() in _TITLE_KEYS and isinstance(fields[k], str)), None)
+        title = str(fields.pop(key)).strip() if key is not None else None
+        out.append((title, fields))
+    return out
+
+
+def _relink_titles(kb: KB) -> None:
+    """Название, взятое из имени файла («Granite Ai»), приводим к написанию из ссылок («Granite AI»)."""
+    values: dict[str, str] = {}
+    for fields in kb.entries.values():
+        for v in fields.values():
+            if isinstance(v, str):
+                values.setdefault(v.lower(), v)
+    for title in list(kb.entries):
+        better = values.get(title.lower())
+        if better and better != title and better not in kb.entries:
+            kb.entries[better] = kb.entries.pop(title)
+            kb.files[better] = kb.files.pop(title)
+            kb.texts[better] = kb.texts.pop(title)
 
 
 def find_mentions(kb: KB, text: str) -> list[str]:
@@ -149,6 +207,25 @@ def find_mentions(kb: KB, text: str) -> list[str]:
     for _, _, title in result:
         seen.setdefault(title)
     return list(seen)
+
+
+def canonicalize_question(kb: KB, text: str) -> str:
+    """Приводит имена записей в вопросе к написанию из базы: «irina smith», «Smith, Irina» -> «Irina Smith»."""
+    out = text
+    low = out.lower()
+    for title in sorted(kb.entries, key=len, reverse=True):
+        if len(title) < 4:
+            continue
+        parts = title.split()
+        if len(parts) == 2:
+            rev = f"{parts[1]}, {parts[0]}"
+            if rev.lower() in low and title.lower() not in low:
+                out = re.sub(r"(?<![\w])" + re.escape(rev) + r"(?![\w])", title, out, flags=re.IGNORECASE)
+                low = out.lower()
+        if title.lower() in low and title not in out:
+            out = re.sub(r"(?<![\w])" + re.escape(title) + r"(?![\w])", title, out, flags=re.IGNORECASE)
+            low = out.lower()
+    return out
 
 
 def unknown_names(kb: KB, text: str) -> list[str]:
@@ -315,4 +392,127 @@ def answer_path_question(kb: KB, question: str) -> PathAnswer:
             return PathAnswer("broken", chain=chain, anchor=anchor,
                               detail=f"hop {hop}: entry {current!r} has no field {name!r}")
         current = record[name]
-    return PathAnswer("ok", answer=str(current).strip(), chain=chain, anchor=anchor)
+    answer = str(current).strip()
+    if answer.lower() in _NO_VALUE or not answer:
+        return PathAnswer("broken", chain=chain, anchor=anchor, detail=f"value of {chain[-1]!r} is {answer!r}: no data")
+    if re.search(r"\byear\b", q, re.IGNORECASE) and not re.fullmatch(r"-?\d+", answer):
+        # «In which year…», а в поле полная дата: 1983-04-12, 12.04.1983, April 12, 1983
+        years = set(re.findall(r"(?<!\d)(1[5-9]\d\d|20\d\d)(?!\d)", answer))
+        if len(years) == 1:
+            answer = years.pop()
+    return PathAnswer("ok", answer=answer, chain=chain, anchor=anchor)
+
+
+# --------------------------------------------------------------------------- сравнение и обратные ссылки
+
+_BORN_FIELDS = ("born", "birth year", "year of birth", "birth")
+_COMPARE_RE = re.compile(
+    r"^(?:who|which (?:person|one|of them|of the two))\s+(?:was|is)\s+"
+    r"(?:(born) (earlier|first|later|last|before|after)|(older|younger))\s*[,:]?\s*(.+?)\s+or\s+(.+?)\s*\?$",
+    re.IGNORECASE)
+# «Who is mentored by X?», «Who is employed by X?», «Whose mentor is X?»
+_INVERSE_RE = re.compile(
+    r"^(?:who|which person)\s+(?:is|was)\s+(\w+?)(?:ed)?\s+by\s+(.+?)\s*\?$|^whose\s+(\w+)\s+(?:is|was)\s+(.+?)\s*\?$",
+    re.IGNORECASE)
+
+
+_KB_SCOPE = r"(?:\s+(?:in|of|from|listed in|recorded in)\s+the\s+(?:knowledge\s+base|kb|database|directory))?"
+_EXTREME_RE = re.compile(
+    r"^who\s+is\s+the\s+(oldest|eldest|youngest)(?:\s+(?:person|individual|employee|one))?" + _KB_SCOPE + r"\s*\?$"
+    r"|^which\s+(?:company|organization|firm)(?:" + _KB_SCOPE + r")?\s+(?:is|was)\s+(?:the\s+)?(?:founded\s+)?"
+    r"(oldest|newest|youngest|first|last|earliest|latest)" + _KB_SCOPE + r"\s*\?$"
+    r"|^which\s+is\s+the\s+(oldest|newest|youngest)\s+(?:company|organization|firm)" + _KB_SCOPE + r"\s*\?$",
+    re.IGNORECASE)
+
+
+def _single_question(question: str) -> Optional[str]:
+    text = question.strip()
+    prefix = "The directory kb/ contains a small knowledge base of markdown files."
+    if text.startswith(prefix):
+        text = text[len(prefix):].strip()
+    sentences = [s.strip() for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
+    questions = [s for s in sentences if s.endswith("?")]
+    return questions[0] if len(questions) == 1 else None
+
+
+def answer_relation_question(kb: KB, question: str) -> PathAnswer:
+    """Сравнение двух записей по году рождения и обратная ссылка («кого наставляет X»).
+
+    Строго: ровно две известные записи с целым годом и разными значениями; для обратной
+    ссылки — ровно одна запись, у которой поле указывает на названную запись.
+    """
+    if not kb.structured:
+        return PathAnswer("unparsed", detail="kb is not structured")
+    q = _single_question(question)
+    if q is None:
+        return PathAnswer("unparsed", detail="expected exactly one question sentence")
+
+    m = _COMPARE_RE.match(q)
+    if m:
+        names = [m.group(4).strip(), m.group(5).strip()]
+        missing = [n for n in names if n not in kb.entries]
+        if missing:
+            if unknown_names(kb, missing[0]) or not find_mentions(kb, missing[0]):
+                return PathAnswer("no_anchor", detail=f"no entry named {missing[0]!r}")
+            return PathAnswer("unparsed", detail=f"not an exact entry name: {missing[0]!r}")
+        if names[0] == names[1]:
+            return PathAnswer("unparsed", detail="the same entry twice")
+        born = []
+        for n in names:
+            key = next((k for k in kb.entries[n] if k.lower() in _BORN_FIELDS), None)
+            if key is None:
+                return PathAnswer("broken", anchor=n, detail=f"entry {n!r} has no birth year")
+            v = kb.entries[n][key]
+            if not isinstance(v, int):
+                return PathAnswer("unparsed", anchor=n, detail=f"birth year of {n!r} is not a number: {v!r}")
+            born.append(v)
+        if born[0] == born[1]:
+            return PathAnswer("broken", detail=f"both born in {born[0]}: no single answer")
+        word = (m.group(2) or m.group(3)).lower()
+        want_earlier = word in ("earlier", "first", "before", "older")
+        pick = names[0] if (born[0] < born[1]) == want_earlier else names[1]
+        return PathAnswer("ok", answer=pick, chain=["compare:" + word], anchor=" vs ".join(names))
+
+    m = _EXTREME_RE.match(q)
+    if m:
+        # «Who is the youngest person in the knowledge base?» — крайнее значение года по всем записям с этим полем.
+        # Считает код: модель без рассуждений путает «младший» (больший год рождения) со «старшим».
+        word = (m.group(1) or m.group(2) or m.group(3)).lower()
+        is_company = bool(m.group(2) or m.group(3))
+        names = ("founded", "established", "founding year") if is_company else _BORN_FIELDS
+        pairs = []
+        for title, fields in kb.entries.items():
+            key = next((k for k in fields if k.lower() in names), None)
+            if key is not None and isinstance(fields[key], int):
+                pairs.append((fields[key], title))
+        if len(pairs) < 2:
+            return PathAnswer("unparsed", detail="not enough entries with a year")
+        earliest = word in ("oldest", "eldest", "first", "earliest")
+        best = min(pairs)[0] if earliest else max(pairs)[0]
+        winners = [t for y, t in pairs if y == best]
+        if len(winners) != 1:
+            return PathAnswer("unparsed", detail=f"{len(winners)} entries share the year {best}")
+        return PathAnswer("ok", answer=winners[0], chain=["extreme:" + word], anchor="*")
+
+    m = _INVERSE_RE.match(q)
+    if m:
+        rel = (m.group(1) or m.group(3) or "").lower()
+        target = (m.group(2) or m.group(4) or "").strip()
+        fields = _field_lookup(kb)
+        stems = {rel, rel + "e", rel.rstrip("e"), rel + "or", rel + "er"}
+        if rel == "employ":
+            stems.add("employer")
+        field_name = next((fields[s] for s in stems if s in fields), None)
+        if field_name is None:
+            return PathAnswer("unparsed", detail=f"no field for relation {rel!r}")
+        if target not in kb.entries:
+            if unknown_names(kb, target):
+                return PathAnswer("no_anchor", detail=f"no entry named {target!r}")
+            return PathAnswer("unparsed", detail=f"not an exact entry name: {target!r}")
+        hits = [t for t, f in kb.entries.items() if f.get(field_name) == target]
+        if len(hits) == 1:
+            return PathAnswer("ok", answer=hits[0], chain=[f"inverse:{field_name}"], anchor=target)
+        if not hits:
+            return PathAnswer("broken", anchor=target, detail=f"nobody has {field_name} = {target!r}")
+        return PathAnswer("unparsed", anchor=target, detail=f"{len(hits)} entries have {field_name} = {target!r}")
+    return PathAnswer("unparsed", detail="not a comparison or inverse question")

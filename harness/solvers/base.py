@@ -264,6 +264,43 @@ class ExprSolver(Solver):
     def post_process(self, value: str) -> str:
         return value
 
+    def shape_answer(self, value: str) -> tuple[Optional[str], str]:
+        """Приводит результат выражения к виду, которого ждёт вопрос. (None, причина) — результат непригоден.
+
+        Модель без рассуждений часто пишет выражение «почти про то»: сравнение вместо имени
+        («Which company was founded earlier, A or B?» -> A_founded < B_founded -> True), год вместо
+        человека, разность с обратным знаком. Тип ожидаемого ответа виден из вопроса — проверяем его
+        бесплатно и возвращаем модели понятное замечание.
+        """
+        from ..tasks import strip_preamble
+
+        q = strip_preamble(self.task.question).strip()
+        ql = q.lower()
+        v = value.strip()
+        yes_no = bool(re.match(r"(?:do|does|did|is|are|was|were|has|have|had|can|could|will|would)\b", ql)) \
+            or bool(re.search(r"\byes or no\b|\btrue or false\b", ql))
+        if v in ("True", "False"):
+            if re.search(r"\btrue or false\b", ql):
+                return v, ""
+            if yes_no:
+                m = re.search(r"\b(yes)\b[^.?!]{0,12}\b(no)\b", q, re.IGNORECASE)
+                yes, no = (m.group(1), m.group(2)) if m else ("yes", "no")
+                return (yes if v == "True" else no), ""
+            return None, ("the code evaluated to True/False, but the question asks for a specific value "
+                          "(a name or a number). Return that value itself.")
+        wants_name = re.match(r"(?:who|whose|whom|which (?:person|company|product|region|employee|city|one|of)|"
+                              r"what is the name|name the)\b", ql)
+        if wants_name and re.fullmatch(r"-?\d+(?:\.\d+)?", v):
+            return None, f"the question asks for a name, but the code evaluated to the number {v}. Return the name."
+        wants_number = re.match(r"(?:how many|how much|in (?:which|what) year|what year|how old)\b", ql)
+        if wants_number and not re.fullmatch(r"-?\d+(?:[.,]\d+)?%?", v):
+            return None, (f"the question asks for a number, but the code evaluated to {v[:60]!r}. "
+                          "Return a single number.")
+        if re.search(r"\b(?:how many years|how much) (?:older|younger)\b|\bage (?:difference|gap)\b|\byears apart\b", ql) \
+                and re.fullmatch(r"-\d+(?:\.\d+)?", v):
+            v = v[1:]   # «на сколько лет старше» — величина, знак зависит только от порядка вычитания
+        return v, ""
+
     async def _ask(self, step: str, messages: list[dict], temperature: float = 0.0) -> Reply:
         role = ROLE_OF_STEP.get(step, "fast")
         strong = role == "strong"
@@ -325,7 +362,10 @@ class ExprSolver(Solver):
         if result.ok and result.value:
             if is_refusal(result.value):
                 return Outcome("refused", note="code evaluated to a refusal"), ""
-            return Outcome("answer", answer=self.post_process(result.value)), ""
+            shaped, problem = self.shape_answer(result.value)
+            if shaped is None:
+                return None, problem
+            return Outcome("answer", answer=self.post_process(shaped)), ""
         if result.missing_data and self.refusal_on_missing_data():
             return Outcome("refused", note=result.error), ""
         return None, result.error or "no result"

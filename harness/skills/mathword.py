@@ -20,7 +20,7 @@ __all__ = ["MathAnswer", "answer_math_question"]
 
 @dataclass
 class MathAnswer:
-    status: str                 # ok | unparsed | error
+    status: str                 # ok | unparsed | error | infeasible (данных для ответа нет)
     answer: Optional[str] = None
     expression: str = ""        # python-выражение, дающее ответ
     steps: list[str] = field(default_factory=list)   # по строке на распознанное предложение
@@ -69,7 +69,14 @@ def answer_math_question(question: str) -> MathAnswer:
     m = _TAIL_RE.search(text)
     if m:
         text = text[: m.start()].strip()
+    text = re.sub(r"^(?:solve the following problem[.:]|problem:|task:|question:|word problem:)\s*", "", text,
+                  flags=re.IGNORECASE)
     sentences = _split_sentences(text)
+    # Служебные фразы после вопроса («Save only the number to answer.txt.») к задаче не относятся.
+    while len(sentences) > 2 and not sentences[-1].endswith("?") and _SERVICE_RE.search(sentences[-1]) \
+            and not re.search(r"\d", sentences[-1].replace("answer.txt", "")) \
+            and any(x.endswith("?") or _IMPERATIVE_Q.match(x) for x in sentences[:-1]):
+        sentences.pop()
     if len(sentences) < 2:
         return MathAnswer("unparsed", detail="нужно хотя бы начальное условие и вопрос")
 
@@ -90,13 +97,35 @@ def answer_math_question(question: str) -> MathAnswer:
     q = sentences[-1]
     S = rf"(?:it|the {re.escape(subj)})"
     I = _plural_re(item)
+    END = r"(?: (?:at the end|in the end|now|left|finally|in total|at the end of the period|after (?:all )?(?:this|that)))?"
+    PLACE = rf"(?: in (?:the {re.escape(subj)}|it|stock))?"
     q_ok = re.fullmatch(
-        rf"how many {I} (?:does {S} have(?: (?:at the end|in the end|now|left))?|"
-        rf"(?:are|remain) left(?: at the end)?|remain(?: at the end)?)\?",
+        rf"how many {I} (?:(?:does|will|would|did) {S} (?:have|hold|end up with|finish with|own){END}"
+        rf"|(?:are|remain|are there|will be|will remain|are left|is)(?: left)?{PLACE}{END}"
+        rf"|remain{PLACE}{END})\?"
+        rf"|what is (?:the|its) final (?:number|count|amount|quantity) of {I}{PLACE}\?"
+        rf"|what is (?:the|its) (?:final|ending|resulting) (?:stock|inventory)(?: of (?:the )?(?:{I}|{re.escape(subj)}))?\?"
+        rf"|what is the (?:number|count) of {I}{PLACE} at the end\?"
+        rf"|(?:find|compute|calculate|determine|give|state|report) (?:the )?(?:final )?(?:number|count) of {I}{PLACE}{END}\.",
         q, re.IGNORECASE,
     )
-    if not q_ok:
-        return MathAnswer("unparsed", steps=steps, detail=f"не понят вопрос: {q!r}")
+    # «How many boxes did it ship in total?» — спрашивают не запас, а сумму по одному глаголу.
+    q_total = re.fullmatch(
+        rf"how many {I} (?:did|has) {S} (ship|shipped|sell|sold|receive|received|lose|lost)"
+        rf"(?: in total| altogether| overall)?\?",
+        q, re.IGNORECASE,
+    )
+    asked_verb = None
+    other_item = None   # вопрос про предмет, которого нет в условии («How many trucks…»)
+    if q_total:
+        asked_verb = _VERB_OF[q_total.group(1).lower()]
+    elif not q_ok:
+        qo = re.fullmatch(rf"how many ([a-z]+) (?:does|did) {S} (?:have|own|keep|hold|use)"
+                          rf"(?: (?:at the end|in the end|now|left))?\?", q, re.IGNORECASE)
+        if qo and not re.fullmatch(I, qo.group(1), re.IGNORECASE):
+            other_item = qo.group(1).lower()
+        else:
+            return MathAnswer("unparsed", steps=steps, detail=f"не понят вопрос: {q!r}")
     if any("?" in s for s in sentences[:-1]):
         return MathAnswer("unparsed", steps=steps, detail="больше одного вопроса")
 
@@ -132,19 +161,48 @@ def answer_math_question(question: str) -> MathAnswer:
         a, b = _num(m.group(1)), _num(m.group(2))
         return (f"{{e}} + {a} * {b}", v + a * b)
 
+    def sub_ac(m, v):
+        a, b = _num(m.group(1)), _num(m.group(3))
+        return (f"{{e}} - {a} * {b}", v - a * b)
+
+    def add_ac(m, v):
+        a, b = _num(m.group(1)), _num(m.group(3))
+        return (f"{{e}} + {a} * {b}", v + a * b)
+
+    def ceildiv_k(m, v):
+        k = _num(m.group(1))
+        if k == 0:
+            raise ZeroDivisionError
+        return (f"-(-{{e}} // {k})", -(-v // k))
+
     def sub_a(m, v):
         a = _num(m.group(1))
         return (f"{{e}} - {a}", v - a)
+
+    def sell_percent(m, v):
+        pct = _num(m.group(1))
+        if not 0 <= pct <= 100:
+            raise _Unparsed(f"странный процент {pct}")
+        rounded = m.group(2) is not None
+        if not rounded and (v * pct) % 100:
+            raise _Unparsed(f"{pct}% от {v} не целое, а правило округления не указано")
+        return (f"{{e}} - {{e}} * {pct} // 100", v - v * pct // 100)
 
     def add_a(m, v):
         a = _num(m.group(1))
         return (f"{{e}} + {a}", v + a)
 
     rd = r" \(rounded down\)"
+    # необязательная причина, не меняющая арифметику: «in a flood», «after a merger»
+    CAUSE = (r"(?: (?:in|after|during|due to|because of|from) (?:a|an|the) [a-z]+(?: [a-z]+)?"
+             r"| by merging with (?:a|an|one|two|three|\d+) sister \w+)?")
     rules: list[tuple[str, str, Callable]] = [
         # обязательные (из примеров)
-        ("ship_per_day", r"{S} (?:ships|sells|sends out) {N} {I} (?:per|each|a) day for {N} days?", sub_ab),
-        ("receive_deliveries", r"{S} receives {N} deliver(?:y|ies) of {N} {I} each", add_ab),
+        ("ship_per_day", r"{S} (?:ships|sells|sends out|gives away|donates|uses|loses) {N} {I} (?:per|each|a) day for {N} days?", sub_ab),
+        ("receive_deliveries", r"{S} receives {N} deliver(?:y|ies) of {N} {I}(?: each)?", add_ab),
+        ("ship_per_unit", r"{S} (?:ships|sells|sends out|gives away|donates|uses|loses) {N} {I} (?:per|each|a|every) ([a-z]+) for {N} \2s?", sub_ac),
+        ("receive_per_unit", r"{S} receives {N} {I} (?:per|each|a|every) ([a-z]+) for {N} \2s?", add_ac),
+        ("split_keep_share_up", r"{ST} is split equally into {N} {W} and (?:it|the \w+) keeps one share \(rounded up\)", ceildiv_k),
         ("split_keep_share", r"{ST} is split equally into {N} {W} and (?:it|the \w+) keeps one share" + rd, floordiv_k(1, True)),
         ("double_merge", r"{ST} is doubled by merging with a sister \w+", mul(2)),
         # родственные однозначные формулировки
@@ -152,18 +210,25 @@ def answer_math_question(question: str) -> MathAnswer:
         ("receive_per_day", r"{S} receives {N} {I} (?:per|each|a) day for {N} days?", add_ab),
         ("receive_n", r"{S} (?:receives|gets|buys|gains) {N} (?:more |new |additional )?{I}", add_a),
         ("receive_delivery_of", r"{S} receives (?:a|one) delivery of {N} {I}", add_a),
-        ("ship_n", r"{S} (?:ships|sells|loses|sends out|gives away|donates) {N} {I}", sub_a),
-        ("double", r"{ST} is doubled", mul(2)),
-        ("triple", r"{ST} is tripled", mul(3)),
-        ("quadruple", r"{ST} is quadrupled", mul(4)),
+        ("ship_n", r"{S} (?:ships|sells|loses|sends out|gives away|donates) {N} {I}" + CAUSE, sub_a),
+        ("sell_percent", r"{S} (?:sells|ships|loses|sends out|gives away) {N} ?(?:percent|%) of (?:its|the) (?:{I}|stock|inventory)"
+                         r"( \((?:the number (?:sold|shipped|lost|sent out|given away) is )?rounded down\))?", sell_percent),
+        ("double", r"{ST} is doubled" + CAUSE, mul(2)),
+        ("triple", r"{ST} is tripled" + CAUSE, mul(3)),
+        ("quadruple", r"{ST} is quadrupled" + CAUSE, mul(4)),
         ("double_active", r"{S} doubles its (?:stock|inventory)", mul(2)),
         ("triple_active", r"{S} triples its (?:stock|inventory)", mul(3)),
         ("halve_rounded", r"{ST} is halved" + rd, lambda m, v: ("{e} // 2", v // 2)),
         ("halve_exact", r"{ST} is halved", halve_exact),
     ]
-    compiled = [(name, re.compile(r"(?:then,? )?" + pat.format(**fmt) + r"\.", re.IGNORECASE), fn)
+    LEAD = (r"(?:(?:and )?(?:then|next|after that|after this|afterwards|afterward|later|first|second|third|finally|lastly|"
+            r"subsequently|at last|in the end),? )?")
+    compiled = [(name, re.compile(LEAD + pat.format(**fmt) + r"\.", re.IGNORECASE), fn)
                 for name, pat, fn in rules]
 
+    totals: dict[str, int] = {}
+    total_exprs: dict[str, list[str]] = {}
+    went_negative = False
     for sent in sentences[1:-1]:
         for name, rx, fn in compiled:
             m = rx.fullmatch(sent)
@@ -172,21 +237,59 @@ def answer_math_question(question: str) -> MathAnswer:
             try:
                 tmpl, new_value = fn(m, value)
             except ZeroDivisionError:
-                return MathAnswer("error", steps=steps, expression=expr, detail=f"деление на ноль: {sent!r}")
+                return MathAnswer("infeasible", steps=steps, expression=expr, detail=f"деление на ноль: {sent!r}")
             except _Unparsed as exc:
                 return MathAnswer("unparsed", steps=steps, expression=expr, detail=str(exc))
             if new_value < 0:
-                return MathAnswer("unparsed", steps=steps, expression=expr,
-                                  detail=f"запас стал отрицательным после {sent!r}")
-            expr = tmpl.format(e=f"({expr})" if not expr.isdigit() else expr)
+                went_negative = True
+            wrapped = f"({expr})" if not expr.isdigit() else expr
+            expr = tmpl.format(e=wrapped)
+            verb = _sentence_verb(sent)
+            if verb is not None:
+                totals[verb] = totals.get(verb, 0) + abs(new_value - value)
+                total_exprs.setdefault(verb, []).append(f"abs(({expr}) - ({wrapped}))")
             value = new_value
             steps.append(f"{name}: {sent} -> {value}")
             break
         else:
+            # «It ships some boxes per day…»: та же операция, но вместо числа — неопределённое слово.
+            vague = re.sub(_VAGUE, "7", sent, count=1, flags=re.IGNORECASE)
+            if vague != sent and any(rx.fullmatch(vague) for _, rx, _ in compiled):
+                return MathAnswer("infeasible", steps=steps, expression=expr,
+                                  detail=f"в условии нет числа: {sent!r}")
             return MathAnswer("unparsed", steps=steps, expression=expr, detail=f"не понято предложение: {sent!r}")
+
+    if other_item is not None:
+        return MathAnswer("infeasible", steps=steps, expression=expr,
+                          detail=f"спрашивают про «{other_item}», а в условии только {item}")
 
     # Самопроверка: выражение должно давать тот же ответ.
     if eval(expr, {"__builtins__": {}}, {}) != value:  # noqa: S307 — выражение собрано нами из чисел
         return MathAnswer("error", steps=steps, expression=expr, detail="выражение расходится со счётом")
+    if asked_verb is not None:
+        if asked_verb not in totals:
+            return MathAnswer("unparsed", steps=steps, expression=expr,
+                              detail=f"спрашивают про «{asked_verb}», а таких операций нет")
+        value = totals[asked_verb]
+        expr = " + ".join(total_exprs[asked_verb])
+        if eval(expr, {"__builtins__": {"abs": abs}}, {}) != value:  # noqa: S307
+            return MathAnswer("error", steps=steps, expression=expr, detail="сумма расходится со счётом")
     steps.append(f"answer: {value}")
     return MathAnswer("ok", answer=str(value), expression=expr, steps=steps)
+
+
+_SERVICE_RE = re.compile(r"answer\.txt|\bbash\b|\bpython\b|\bcurrent directory\b|\bwrite\b|\bsave\b|\bfile\b|\btool\b"
+                         r"|\bcalculate\b|\bcompute\b|\binteger\b|\bnumber\b", re.IGNORECASE)
+_IMPERATIVE_Q = re.compile(r"(?:find|compute|calculate|determine|give|state|report)\b", re.IGNORECASE)
+_VAGUE = r"\b(?:some|several|a few|many|a number of|an unknown number of|a certain number of)\b"
+
+_VERB_OF = {"ship": "ship", "shipped": "ship", "sell": "sell", "sold": "sell",
+            "receive": "receive", "received": "receive", "lose": "lose", "lost": "lose"}
+_VERB_RE = [("ship", re.compile(r"\b(?:ships|sends out)\b", re.I)), ("sell", re.compile(r"\bsells\b", re.I)),
+            ("receive", re.compile(r"\breceives\b", re.I)), ("lose", re.compile(r"\bloses\b", re.I))]
+
+
+def _sentence_verb(sentence: str) -> Optional[str]:
+    """Глагол операции, по которому её можно сложить в «сколько отгружено всего»."""
+    found = [verb for verb, rx in _VERB_RE if rx.search(sentence)]
+    return found[0] if len(found) == 1 else None

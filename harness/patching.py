@@ -67,7 +67,7 @@ def apply_patch(original: str, patch: str) -> Optional[str]:
         got = {n for n in (_named(node) for node in patch_tree.body) if n}
         if wanted and len(wanted & got) >= max(1, int(0.8 * len(wanted))):
             return patch + "\n"
-        return None
+        return _replace_blocks_by_text(original, patch_tree, patch_lines)
 
     lines = original.splitlines()
     spans: dict[str, tuple[int, int]] = {}
@@ -115,6 +115,39 @@ def apply_patch(original: str, patch: str) -> Optional[str]:
         result += "\n\n" + "\n\n\n".join(additions) + "\n"
     if new_imports:
         result = _insert_imports(result, new_imports)
+    try:
+        compile(result, "<patched>", "exec")
+    except (SyntaxError, ValueError):
+        return None
+    return result
+
+
+def _replace_blocks_by_text(original: str, patch_tree: ast.Module, patch_lines: list[str]) -> Optional[str]:
+    """Исходник не разбирается, а заплатка — несколько функций: заменяем их блоки по тексту
+    (от строки «def имя(» до следующего оператора верхнего уровня). Годится, если после замены файл компилируется."""
+    lines = original.splitlines()
+    replaced = 0
+    for node in patch_tree.body:
+        name = _named(node)
+        if not name or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        head = re.compile(r"^(?:async\s+def|def|class)\s+" + re.escape(name) + r"\b")
+        start = next((i for i, line in enumerate(lines) if head.match(line)), None)
+        if start is None:
+            continue
+        end = start + 1
+        while end < len(lines):
+            line = lines[end]
+            if line.strip() and not line[0].isspace() and not line.lstrip().startswith("#"):
+                break
+            end += 1
+        while end > start + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines[start:end] = patch_lines[_node_start(node) - 1: node.end_lineno]
+        replaced += 1
+    if not replaced:
+        return None
+    result = "\n".join(lines).rstrip("\n") + "\n"
     try:
         compile(result, "<patched>", "exec")
     except (SyntaxError, ValueError):

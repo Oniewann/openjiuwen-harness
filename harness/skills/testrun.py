@@ -22,7 +22,8 @@ from harness import sandbox
 
 __all__ = [
     "TestReport", "find_test_command", "run_tests", "summarize_failures",
-    "test_files", "source_files", "snapshot", "contradictory_asserts",
+    "test_files", "source_files", "snapshot", "contradictory_asserts", "unsatisfiable_tests",
+    "fallback_test_command",
 ]
 
 _DETAIL_LIMIT = 300
@@ -101,6 +102,33 @@ def find_test_command(instruction: str, workspace: Path) -> list[str]:
     if len(tests) == 1:
         return sandbox.python_argv(str(tests[0].relative_to(workspace)))
     return sandbox.python_argv("-m", "unittest", "discover", "-v")
+
+
+def fallback_test_command(workspace: Path) -> Optional[list[str]]:
+    """Команда на случай, когда указанная в условии не выполнила ни одного теста.
+
+    Так бывает, если тестовый файл сам себя не запускает: нет `unittest.main()` или тесты — голые
+    функции в стиле pytest. Успешный код возврата при нуле выполненных тестов ничего не доказывает.
+    """
+    workspace = Path(workspace)
+    tests = test_files(workspace)
+    if not tests:
+        return None
+    texts = []
+    for path in tests:
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            texts.append("")
+    if any(re.search(r"\bTestCase\b", t) for t in texts):
+        top = [p for p in tests if p.parent == workspace]
+        if len(top) == len(tests):
+            return sandbox.python_argv("-m", "unittest", "-v", *[p.stem for p in top])
+        return sandbox.python_argv("-m", "unittest", "discover", "-v")
+    if any(re.search(r"^(?:async\s+)?def test\w*\(", t, re.MULTILINE) for t in texts):
+        runner = Path(__file__).with_name("plainrun.py")
+        return sandbox.python_argv(str(runner), *[str(p.relative_to(workspace)) for p in tests])
+    return None
 
 
 # ---------------------------------------------------------------- разбор вывода
@@ -548,3 +576,63 @@ def contradictory_asserts(workspace: Path) -> list[str]:
                 if len(out) >= 20:
                     return out
     return out
+
+
+# ---------------------------------------------------------------- тесты, которые не пройдут ни при каком коде
+
+_PURE_NODES = (ast.Constant, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.List, ast.Tuple, ast.Set, ast.Dict,
+               ast.operator, ast.unaryop, ast.boolop, ast.cmpop, ast.expr_context)
+
+
+def _const_value(node: ast.AST) -> tuple[bool, object]:
+    """Значение выражения из одних констант (1, 2 + 2, [1, 2]); (False, None) — выражение не константное."""
+    if not all(isinstance(n, _PURE_NODES) for n in ast.walk(node)):
+        return False, None
+    try:
+        return True, eval(compile(ast.Expression(body=node), "<const>", "eval"), {"__builtins__": {}}, {})  # noqa: S307
+    except Exception:  # noqa: BLE001
+        return False, None
+
+
+def unsatisfiable_tests(workspace: Path) -> list[str]:
+    """Причины, по которым тесты не пройдут ни при какой правке исходников (править тесты нельзя):
+    тестовый файл с синтаксической ошибкой; безусловное утверждение над константами («assertEqual(1, 2)»,
+    «assertTrue(False)», «self.fail()»)."""
+    reasons: list[str] = []
+    for path in test_files(workspace):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError) as exc:
+            reasons.append(f"{path.name} has a syntax error (line {getattr(exc, 'lineno', '?')}) and tests must not be edited")
+            continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or not fn.name.startswith("test"):
+                continue
+            for stmt in fn.body:          # только безусловные операторы верхнего уровня теста
+                bad = None
+                if isinstance(stmt, ast.Assert):
+                    ok, value = _const_value(stmt.test)
+                    if ok and not value:
+                        bad = ast.unparse(stmt)
+                elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                    call = stmt.value
+                    name = _self_assert(call)
+                    args = call.args
+                    if name == "fail":
+                        bad = ast.unparse(call)
+                    elif name in ("assertTrue", "assert_", "assertFalse") and args:
+                        ok, value = _const_value(args[0])
+                        if ok and bool(value) != (name != "assertFalse"):
+                            bad = ast.unparse(call)
+                    elif name in _EQ_NAMES | _NE_NAMES and len(args) >= 2:
+                        ok_a, a = _const_value(args[0])
+                        ok_b, b = _const_value(args[1])
+                        if ok_a and ok_b and _safe_eq(a, b) is not None and _safe_eq(a, b) != (name in _EQ_NAMES):
+                            bad = ast.unparse(call)
+                if bad:
+                    reasons.append(f"{fn.name}: `{bad[:120]}` can never pass")
+    return reasons

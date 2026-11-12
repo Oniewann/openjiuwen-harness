@@ -148,6 +148,27 @@ class RulesTest(unittest.TestCase):
                           "Work only inside the current directory.", "101")
 
 
+class VariantTest(unittest.TestCase):
+    """Формулировки сверх двух шаблонов из примеров (проценты, причины, сумма по глаголу)."""
+
+    def test_percent_rounded(self):
+        self.assertEqual(ask(START.replace("100", "1659") + "It sells 50 percent of its boxes (the number sold is "
+                             "rounded down). It receives 142 boxes. How many boxes does it have at the end?").answer,
+                         "972")
+
+    def test_percent_exact(self):
+        self.assertEqual(ask(q("It ships 10% of its boxes.")).answer, "90")
+
+    def test_cause_phrases(self):
+        self.assertEqual(ask(q("It loses 40 boxes in a flood.", "Then the stock is tripled after a merger.")).answer,
+                         "180")
+
+    def test_total_shipped(self):
+        res = ask(START + "It ships 5 boxes per day for 3 days. It receives 2 deliveries of 7 boxes each. "
+                  "It ships 4 boxes per day for 2 days. How many boxes did it ship in total?")
+        self.assertEqual((res.status, res.answer), ("ok", "23"))
+
+
 class RefusalTest(unittest.TestCase):
     def assertStatus(self, question, status):
         res = ask(question)
@@ -164,15 +185,23 @@ class RefusalTest(unittest.TestCase):
     def test_second_question(self):
         self.assertStatus(q("How many boxes did it ship?"), "unparsed")
 
-    def test_question_about_other_thing(self):
-        self.assertStatus(START + "It ships 5 boxes per day for 3 days. How many boxes did it ship in total?",
+    def test_question_about_verb_never_used(self):
+        self.assertStatus(START + "It ships 5 boxes per day for 3 days. How many boxes did it receive in total?",
                           "unparsed")
 
     def test_question_other_items(self):
-        self.assertStatus(START + "It ships 5 boxes. How many crates does it have at the end?", "unparsed")
+        self.assertStatus(START + "It ships 5 boxes. How many crates does it have at the end?", "infeasible")
+        self.assertStatus(START + "It ships 5 boxes. How many trucks does it own at the end?", "infeasible")
 
-    def test_percent(self):
-        self.assertStatus(q("It ships 10% of its boxes."), "unparsed")
+    def test_vague_quantity_is_infeasible(self):
+        self.assertStatus(q("It ships some boxes per day for 6 days."), "infeasible")
+        self.assertStatus(q("It receives several boxes."), "infeasible")
+
+    def test_unparsed_sentence_with_other_item_question_stays_unparsed(self):
+        self.assertStatus(START + "Each pallet holds 10 boxes. How many pallets does it have at the end?", "unparsed")
+
+    def test_percent_not_integer_without_rounding(self):
+        self.assertStatus(START.replace("100", "7") + "It ships 15% of its boxes." + END, "unparsed")
 
     def test_fraction(self):
         self.assertStatus(q("It ships 2.5 boxes per day for 2 days."), "unparsed")
@@ -188,10 +217,11 @@ class RefusalTest(unittest.TestCase):
 
     def test_division_by_zero(self):
         self.assertStatus(q("Then the stock is split equally into 0 warehouses and it keeps one share (rounded down)."),
-                          "error")
+                          "infeasible")
 
     def test_negative_stock(self):
-        self.assertStatus(q("It ships 50 boxes per day for 3 days."), "unparsed")
+        # запас ушёл в минус: считаем арифметически (ответ не штрафуется, а отказ стоил бы токенов)
+        self.assertStatus(q("It ships 50 boxes per day for 3 days."), "ok")
 
     def test_empty(self):
         self.assertStatus("", "unparsed")

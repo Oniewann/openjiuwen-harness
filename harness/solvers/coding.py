@@ -471,21 +471,24 @@ class CodingSolver(Solver):
         if report is None or not report.ok:
             self.note("crosscheck", used="mutation", why="the model's version fails the tests")
             return done
-        differs = None
+        differs, informative = None, False
         try:
-            from ..skills.semantic import behavior_diff
+            from ..skills.semantic import behavior_compare
 
-            differs = await asyncio.to_thread(
-                behavior_diff, self.ws, {self._rel(p): t for p, t in self.current.items()},
+            differs, informative = await asyncio.to_thread(
+                behavior_compare, self.ws, {self._rel(p): t for p, t in self.current.items()},
                 {self._rel(p): t for p, t in candidate.items()})
         except Exception:  # noqa: BLE001
             pass
-        if differs == []:
+        if differs == [] and informative:
             self.note("crosscheck", used="mutation", agree=True)
             return done
+        # Различия нашлись или пробы ничего не различают (обе версии бросают одно и то же исключение,
+        # правка в методе класса): совпадение не доказано, а версия модели проходит те же тесты.
         await asyncio.to_thread(self._write, candidate)
         self.current, self.report = candidate, report
-        self.note("crosscheck", used="model", agree=False if differs else None, differs=(differs or [])[:8])
+        self.note("crosscheck", used="model", agree=False if differs else None, differs=(differs or [])[:8],
+                  **({"why": "uninformative probes"} if differs == [] else {}))
         return done
 
     def _try_in_copy(self, texts: dict[Path, str]):

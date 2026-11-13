@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import datetime
 import difflib
 import io
 import json
@@ -41,7 +42,8 @@ from typing import Optional
 from harness import sandbox
 from harness.skills.testrun import TestReport, run_tests, source_files, test_files
 
-__all__ = ["SemanticResult", "reference_repair", "align_touched", "behavior_diff", "known_function"]
+__all__ = ["SemanticResult", "reference_repair", "align_touched", "behavior_diff", "behavior_compare",
+           "known_function"]
 
 # ---------------------------------------------------------------- эталоны
 # Имя -> варианты тела. Функция в эталоне всегда называется f; параметры переименовываются под исходник.
@@ -338,6 +340,9 @@ def _literal_calls(test_text: str, name: str) -> list[tuple]:
     return out
 
 
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def _variants(value: object) -> list:
     if isinstance(value, bool):
         return [not value]
@@ -346,6 +351,13 @@ def _variants(value: object) -> list:
     if isinstance(value, float):
         return [0.0, 1.5, -value, value + 1]
     if isinstance(value, str):
+        if _ISO_DATE.fullmatch(value):
+            # дата ISO: остальные строки дали бы одну и ту же ошибку разбора в обеих версиях
+            try:
+                day = datetime.date.fromisoformat(value)
+                return [(day + datetime.timedelta(days=k)).isoformat() for k in range(-7, 8) if k] + [""]
+            except (ValueError, OverflowError):
+                pass
         return ["", "a", "ab", "abc cba", "Hello World", "one two three four", value.upper(), value[::-1],
                 value + " zeta", "level", "Banana apple", "x"]
     if isinstance(value, list):
@@ -972,30 +984,61 @@ def _import_target(tests: str, texts: dict[str, str]) -> Optional[str]:
 
 def behavior_diff(workspace: Path, texts_a: dict[str, str], texts_b: dict[str, str]) -> Optional[list[str]]:
     """Функции, которые ведут себя по-разному в двух версиях исходников (None — сравнить не удалось)."""
+    return behavior_compare(workspace, texts_a, texts_b)[0]
+
+
+# столько проб, где хотя бы одна версия вернула значение, нужно каждой изменённой функции,
+# чтобы совпадение ответов что-то значило
+MIN_INFORMATIVE_PROBES = 3
+
+
+def behavior_compare(workspace: Path, texts_a: dict[str, str],
+                     texts_b: dict[str, str]) -> tuple[Optional[list[str]], bool]:
+    """(различия как у behavior_diff, информативны ли пробы). Пробы неинформативны, если изменённую функцию
+    пробы не вызывают (метод класса, нет вызовов в тестах) или почти на всех пробах обе версии бросают
+    исключение: тогда пустой список различий не значит, что версии совпадают."""
     workspace = Path(workspace)
     tests = _tests_text(workspace)
-    cases, names = [], []
+    cases, names, changed = [], [], []
+    informative = True
     for rel, a in texts_a.items():
         b = texts_b.get(rel)
         if b is None or a == b:
             continue
-        for block in _blocks(a)[1]:
+        lines_a, blocks_a = _blocks(a)
+        lines_b, blocks_b = _blocks(b)
+        src_a = {bl.name: "".join(lines_a[bl.start:bl.end]) for bl in blocks_a}
+        src_b = {bl.name: "".join(lines_b[bl.start:bl.end]) for bl in blocks_b}
+        rest_a = "".join(ln for i, ln in enumerate(lines_a) if not any(bl.start <= i < bl.end for bl in blocks_a))
+        rest_b = "".join(ln for i, ln in enumerate(lines_b) if not any(bl.start <= i < bl.end for bl in blocks_b))
+        if rest_a.strip() != rest_b.strip():
+            # правка вне верхнеуровневых функций (класс, константа): пробами её не проверить
+            informative = False
+        for block in blocks_a:
+            touched = src_a.get(block.name) != src_b.get(block.name)
             calls = _literal_calls(tests, block.name)
             if not calls:
+                if touched:
+                    informative = False
                 continue
             pr = repr(_probes(calls))
             k = len(names)
             names.append(block.name)
+            changed.append(touched)
             cases.append({"id": f"a{k}", "source": a, "func": block.name, "probes": pr})
             cases.append({"id": f"b{k}", "source": b, "func": block.name, "probes": pr})
     if not cases:
-        return []
+        return [], False
     sigs = _signatures(workspace, cases)
     if not sigs:
-        return None
+        return None, False
     diff = []
     for k, name in enumerate(names):
         sa, sb = sigs.get(f"a{k}"), sigs.get(f"b{k}")
         if sa is None or sb is None or sa != sb:
             diff.append(name)
-    return diff
+        elif changed[k]:
+            useful = sum(1 for x, y in zip(sa, sb) if not (x.startswith("EXC:") and y.startswith("EXC:")))
+            if useful < MIN_INFORMATIVE_PROBES:
+                informative = False
+    return diff, informative

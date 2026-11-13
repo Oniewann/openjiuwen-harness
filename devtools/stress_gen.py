@@ -1535,7 +1535,8 @@ def d_avg_round2(rng):
     xs = [r["price"] for r in rows if r["product"] == p]
     if not xs:
         return d_avg_round2(rng)
-    val = f"{sum(xs) / len(xs):.2f}"
+    # как print(round(x, 2)) и как пишет решение: нули в конце не дописываются, целое — целым
+    val = (lambda a: str(int(a)) if a.is_integer() else repr(a))(round(sum(xs) / len(xs), 2))
     return DQ(f"What is the average price of product '{p}', rounded to 2 decimal places?", val, rows, check="exact_str")
 
 

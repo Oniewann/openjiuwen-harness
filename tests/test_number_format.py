@@ -30,16 +30,18 @@ class CanonicalNumber(unittest.TestCase):
 
 
 class FitNumberToQuestion(unittest.TestCase):
-    def test_rounded_places_padded(self):
-        cases = {"46": "46.00", "46.0": "46.00", "23.4": "23.40", "23.45": "23.45", "23.456": "23.46",
-                 "-1.5": "-1.50", "-0.001": "0.00", "1e-05": "0.00"}
+    def test_rounded_places_like_round(self):
+        # как print(round(x, N)): нули в конце не дописываются, целое — целым
+        cases = {"46": "46", "46.0": "46", "46.00": "46", "23.4": "23.4", "23.40": "23.4", "23.45": "23.45",
+                 "23.456": "23.46", "-1.5": "-1.5", "-0.001": "0", "1e-05": "0", "25.40": "25.4"}
         for raw, want in cases.items():
             self.assertEqual(fit_number_to_question(raw, AVG2), want, raw)
 
     def test_rounded_places_variants(self):
-        self.assertEqual(fit_number_to_question("3.1", "Compute the mean. Round it to 3 decimal places."), "3.100")
-        self.assertEqual(fit_number_to_question("7", "What is the ratio, rounded to one decimal place?"), "7.0")
-        self.assertEqual(fit_number_to_question("2.5", "Give the average with 2 decimal digits."), "2.50")
+        self.assertEqual(fit_number_to_question("3.1", "Compute the mean. Round it to 3 decimal places."), "3.1")
+        self.assertEqual(fit_number_to_question("3.14159", "Compute the mean. Round it to 3 decimal places."), "3.142")
+        self.assertEqual(fit_number_to_question("7", "What is the ratio, rounded to one decimal place?"), "7")
+        self.assertEqual(fit_number_to_question("2.50", "Give the average with 2 decimal digits."), "2.5")
 
     def test_rounded_places_not_about_answer(self):
         q = "How many products have an average price above 12.5, rounded to 2 decimal places?"
@@ -55,8 +57,9 @@ class FitNumberToQuestion(unittest.TestCase):
                   "What is the number of products whose price, rounded to 2 decimal places, exceeds 5?",
                   "The table lists prices with 2 decimal places. How many products cost more than 10?"):
             self.assertEqual(fit_number_to_question("7", q), "7", q)
-            self.assertEqual(fit_number_to_question("7.5", q), "7.50", q)   # дробное значение — не счёт
-        self.assertEqual(fit_number_to_question("7", AVG2), "7.00")
+            self.assertEqual(fit_number_to_question("7.5", q), "7.5", q)
+            self.assertEqual(fit_number_to_question("7.456", q), "7.46", q)   # дробное значение — не счёт
+        self.assertEqual(fit_number_to_question("7.00", AVG2), "7")
 
     def test_no_instruction_print_like(self):
         self.assertEqual(fit_number_to_question("0.50", AVG), "0.5")
@@ -73,7 +76,7 @@ class FitNumberToQuestion(unittest.TestCase):
     def test_copied_value_kept(self):
         # search: число переписано из базы, эталон — запись как есть
         self.assertEqual(fit_number_to_question("4.50", "What is the rating of Iris Optics?", computed=False), "4.50")
-        self.assertEqual(fit_number_to_question("4.5", AVG2, computed=False), "4.50")
+        self.assertEqual(fit_number_to_question("4.50", AVG2, computed=False), "4.50")
 
     def test_idempotent(self):
         for q in (AVG, AVG2):
@@ -87,9 +90,10 @@ class ShapeAnswerNumbers(unittest.TestCase):
         stub = types.SimpleNamespace(task=types.SimpleNamespace(question=question), family=family)
         return ExprSolver.shape_answer(stub, value)
 
-    def test_shape_pads_rounded(self):
-        self.assertEqual(self._shape(AVG2, "46"), ("46.00", ""))
-        self.assertEqual(self._shape(AVG2, "23.4"), ("23.40", ""))
+    def test_shape_rounded_like_round(self):
+        self.assertEqual(self._shape(AVG2, "46"), ("46", ""))
+        self.assertEqual(self._shape(AVG2, "23.40"), ("23.4", ""))
+        self.assertEqual(self._shape(AVG2, "23.456"), ("23.46", ""))
 
     def test_shape_examples_unchanged(self):
         # стиль эталонов из примеров: целые и строки не меняются

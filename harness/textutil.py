@@ -160,8 +160,9 @@ _SCI_NUM_RE = re.compile(r"-?(\d+)(?:\.(\d+))?(?:[eE][+-]?\d+)?")
 def fit_number_to_question(value: str, question: str, computed: bool = True) -> str:
     """Числовой ответ в том виде, в каком его, вероятнее всего, записал автор задачи.
 
-    «rounded to N decimal places» — ровно N знаков после точки: 46 -> 46.00, 23.4 -> 23.40,
-    23.456 -> 23.46 (модель забыла округлить). Без указаний о виде числа — как print():
+    «rounded to N decimal places» — как print(round(x, N)): не больше N знаков, нули в конце не
+    дописываются: 23.456 -> 23.46 (модель забыла округлить), 23.40 -> 23.4, 46.00 -> 46 (целое —
+    целым, как в эталонах exact_int). Без указаний о виде числа — как print():
     0.50 -> 0.5; целые остаются целыми (12.0 -> 12, как в эталонах exact_int). Нечисловые ответы
     и всё спорное возвращаются как есть.
 
@@ -181,10 +182,17 @@ def fit_number_to_question(value: str, question: str, computed: bool = True) -> 
             return value
         frac = m.group(2) or ""
         if "e" not in value.lower() and len(frac) <= n:
-            out = value.split(".")[0] + "." + frac.ljust(n, "0")
+            if not computed:
+                return value    # search: значение переписано из базы — как есть
+            out = value     # знаков не больше N — не трогаем, только срезаем нули в конце (ниже)
         else:
-            out = f"{round(float(value), n):.{n}f}"
-        return out.lstrip("-") if float(out) == 0 else out
+            out = repr(round(float(value), n))
+            if "e" in out.lower():
+                out = f"{round(float(value), n):.{n}f}"
+        # как print(round(x, N)): нули в конце не дописываются (25.4, а не 25.40); целое — целым
+        if "." in out:
+            out = out.rstrip("0")
+        return canonical_number(out)
     if not computed or _FORMAT_WORDS_RE.search(question or "") or "e" in value.lower():
         return value
     if m.group(2) and value.endswith("0"):

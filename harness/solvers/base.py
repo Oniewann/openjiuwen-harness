@@ -243,6 +243,7 @@ class ExprSolver(Solver):
     system_prompt = ""
     refusal_hint = "IMPOSSIBLE"
     max_tokens_fast: Optional[int] = None
+    _attempt: Optional[tuple] = None        # (код, результат) последней вычисленной попытки
 
     def user_prompt(self) -> str:
         return self.task.question
@@ -313,6 +314,17 @@ class ExprSolver(Solver):
         return await asyncio.to_thread(run_pot, code, self.preload(code), self.cwd(), self.scratch,
                                        self.cfg.exec_timeout_s)
 
+    def refusal_word(self) -> str:
+        """Слово отказа из системной инструкции решателя (search просит NOT_FOUND, остальные — IMPOSSIBLE)."""
+        return "NOT_FOUND" if "NOT_FOUND" in self.system_prompt else self.refusal_hint
+
+    def retry_prompt(self, error: str) -> str:
+        """Замечание на втором ходу. Повторяет договор целиком: после «исправь код» модель без
+        напоминания забывает право на отказ и подставляет выдуманное значение (N = 0, список «из файла»)."""
+        return (f"That failed: {error}\nReply with the corrected code only. If a value the answer needs is not "
+                f"given in the problem or in the data, reply {self.refusal_word()} instead. "
+                "Never invent numbers, names or file contents.")
+
     async def run_step(self, step: str) -> Outcome:
         if step == "react":
             from .react import run_react
@@ -322,14 +334,16 @@ class ExprSolver(Solver):
                     {"role": "user", "content": self.user_prompt()}]
         try:
             reply = await self._ask(step, messages, temperature=0.0 if step != "fast_alt" else 0.2)
+            self._attempt = None
             outcome, error = await self._interpret(step, reply)
             if outcome is None:
                 # одна попытка исправления той же моделью: дешевле, чем подниматься на ступень выше
                 self.shaky = True
+                first = self._attempt
                 messages += [{"role": "assistant", "content": reply.text[:1500]},
-                             {"role": "user", "content": f"That failed: {error}\nReply with the corrected code only."}]
+                             {"role": "user", "content": self.retry_prompt(error)}]
                 reply = await self._ask(step, messages, temperature=0.3)
-                outcome, error = await self._interpret(step, reply)
+                outcome, error = await self._interpret(step, reply, previous=first)
                 if outcome is None:
                     outcome = Outcome("failed", note=error)
             return outcome
@@ -340,8 +354,12 @@ class ExprSolver(Solver):
         except LLMError as exc:
             return Outcome("infra", note=str(exc))
 
-    async def _interpret(self, step: str, reply: Reply) -> tuple[Optional[Outcome], str]:
-        """Разбирает ответ модели. Возвращает (итог, "") либо (None, текст ошибки для исправления)."""
+    async def _interpret(self, step: str, reply: Reply,
+                         previous: Optional[tuple[str, PotResult]] = None) -> tuple[Optional[Outcome], str]:
+        """Разбирает ответ модели. Возвращает (итог, "") либо (None, текст ошибки для исправления).
+
+        `previous` — код и результат первой попытки, если это ответ на замечание.
+        """
         text = reply.text
         self.note(step, model=reply.model, cost=round(reply.cost, 1), prompt_tokens=reply.prompt_tokens,
                   completion_tokens=reply.completion_tokens, reasoning_tokens=reply.reasoning_tokens,
@@ -353,19 +371,227 @@ class ExprSolver(Solver):
             return None, "empty reply" + (" (cut off by the token limit)" if reply.truncated else "")
         code = extract_code(text)
         if not looks_like_code(code):
-            # модель ответила значением, а не кодом — принимаем короткий ответ как есть
+            # модель ответила значением, а не кодом — принимаем короткий ответ как есть,
+            # но для search и data_analysis только если он есть в данных (иначе это память модели)
             plain = normalize_answer(text)
             if plain and len(plain) <= 60 and "\n" not in text.strip():
+                missing = self.ungrounded(plain)
+                if missing:
+                    return None, missing
                 return Outcome("answer", answer=self.post_process(plain)), ""
             return None, "reply is not Python code"
         result = await self._evaluate(code)
+        self._attempt = (code, result)
         if result.ok and result.value:
             if is_refusal(result.value):
                 return Outcome("refused", note="code evaluated to a refusal"), ""
+            if previous is not None:
+                invented = invented_values(code, previous[0], previous[1],
+                                           self.task.question + "\n" + self.user_prompt())
+                if invented:
+                    # После ошибки «нет такого имени/файла/ключа» исправление вписало значения, которых
+                    # нет ни в условии, ни в первой попытке: это выдумка, а не исправление.
+                    self.note(step, invented=invented[:5])
+                    return Outcome("failed", note=f"corrected code invents values: {', '.join(invented[:3])}"), ""
             shaped, problem = self.shape_answer(result.value)
             if shaped is None:
                 return None, problem
+            missing = self.ungrounded(shaped, code)
+            if missing:
+                return None, missing
             return Outcome("answer", answer=self.post_process(shaped)), ""
+        if not result.ok:
+            absent = self.absent_input(result)
+            if absent:
+                return Outcome("refused", note=absent), ""
         if result.missing_data and self.refusal_on_missing_data():
             return Outcome("refused", note=result.error), ""
         return None, result.error or "no result"
+
+    # ------------------------------------------------------------------ «данных нет» и заземление
+    def absent_input(self, result: PotResult) -> str:
+        """Причина отказа, если ошибка в коде модели сама означает «нужного значения нет в условии».
+
+        FileNotFoundError на файле, который упомянут в условии и которого нет в каталоге задачи;
+        NameError (math) на обозначении из условия вроде «N boxes». Повтор тут бесполезен: модель
+        «исправит» код, подставив выдуманное значение. Пустая строка — ошибка обычная.
+        """
+        question = self.task.question
+        if result.etype == "FileNotFoundError":
+            m = re.search(r"No such file or directory: '([^']+)'", result.error)
+            name = Path(m.group(1)).name if m else ""
+            if not name or not re.search(r"(?<![\w.\-])" + re.escape(name) + r"(?![\w\-])", question):
+                return ""
+            ws = self.task.workspace
+            try:
+                present = ws.is_dir() and any(p.name == name for p in ws.rglob("*"))
+            except OSError:
+                present = True
+            return "" if present else f"file {name} mentioned in the task does not exist"
+        if result.etype == "NameError" and self.family == "math":
+            m = re.search(r"name '(\w+)' is not defined", result.error)
+            name = m.group(1) if m else ""
+            if is_symbol(name) and re.search(r"(?<![\w'])" + re.escape(name) + r"(?![\w'])", question):
+                return f"the problem uses the unknown quantity {name} without giving its value"
+        return ""
+
+    def grounding_text(self) -> Optional[str]:
+        """Текст данных (в нижнем регистре), в котором должен встречаться строковый ответ.
+
+        search — тексты базы знаний, названия записей и значения полей; data_analysis — имена столбцов
+        и файлы таблиц как есть. Для остальных семейств None: проверять не по чему.
+        """
+        if hasattr(self, "_grounding"):
+            return self._grounding
+        parts: list[str] = []
+        try:
+            if self.family == "search" and getattr(self, "kb", None) is not None:
+                kb = self.kb
+                parts += list(kb.texts.values()) + list(kb.entries)
+                for fields in kb.entries.values():
+                    parts += [str(v) for v in (fields or {}).values()]
+            elif self.family == "data_analysis" and getattr(self, "tables", None):
+                # значения уже загруженных строк (подходит и для xlsx/json), плюс текст csv как есть
+                for table in self.tables:
+                    parts += [str(c) for c in table.columns]
+                    for row in table.rows[:300_000]:
+                        parts += [str(v) for v in row.values() if isinstance(v, str)]
+                    if table.path.suffix.lower() in (".csv", ".tsv", ".txt") and table.path.stat().st_size < 40_000_000:
+                        parts.append(table.path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001 — проверка не должна ронять решатель
+            parts = []
+        self._grounding = "\n".join(parts).lower() if parts else None
+        return self._grounding
+
+    def ungrounded(self, answer: str, code: Optional[str] = None) -> str:
+        """Замечание, если строковый ответ search/data_analysis не встречается в данных; иначе "".
+
+        Проверяются слова ответа (числа, да/нет, месяцы не проверяются). Для ответа, вычисленного кодом,
+        — только слова, которые модель сама вписала строковым литералом: значение, взятое из rows/kb,
+        заземлено по построению.
+        """
+        text = self.grounding_text()
+        if not text:
+            return ""
+        typed = " ".join(code_string_literals(code)).lower() if code is not None else None
+
+        def found(word: str) -> bool:
+            w = word.lower()
+            # пересказ: «robots» при «robotics» в тексте — сравниваем и по основе слова
+            return w in text or (len(w) >= 6 and w[:max(5, len(w) - 2)] in text)
+
+        missing: list[str] = []
+        # Элемент перечисления выдуман, если в данных нет ни одного его слова («Alice Novak» в базе без
+        # Alice и Novak). Частичное совпадение («industrial robots» при «industrial robotics») — не выдумка.
+        for part in re.split(r",|;|\band\b", answer):
+            if re.search(r"\d", part):
+                continue            # числа и даты вычисляются, их не ищем
+            words = [w for w in re.findall(r"[^\W\d_]{2,}", part) if w.lower() not in _UNCHECKED_WORDS]
+            if typed is not None:
+                words = [w for w in words if w.lower() in typed]
+            if words and not any(found(w) for w in words):
+                missing.append(words[0])
+        if not missing:
+            return ""
+        source = "the knowledge base" if self.family == "search" else "the data file"
+        return (f"{answer[:60]!r} does not occur in {source} (there is no {missing[0]!r} in it). "
+                "Compute the answer from the data instead of writing it yourself, "
+                f"or reply {self.refusal_word()} if the data does not contain it.")
+
+
+# Слова ответа, которые не обязаны встречаться в данных: да/нет, служебные, месяцы и дни недели
+# (их часто выводят из дат вида 2024-03-15).
+_UNCHECKED_WORDS = frozenset(
+    "yes no true false none null and or not the of in on at to by for nan inf".split()
+    + "january february march april may june july august september october november december".split()
+    + "jan feb mar apr jun jul aug sep sept oct nov dec".split()
+    + "monday tuesday wednesday thursday friday saturday sunday".split()
+)
+
+# Числа, которые исправленный код вправе ввести сам: единицы и обычные константы перевода единиц.
+_PLAIN_NUMBERS = frozenset({0, 1, 2, 10, 100, 1000, 7, 12, 24, 30, 31, 52, 60, 365, 366, 3600, 1440, 0.5})
+
+_NUMBER_WORDS = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+    r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+    r"dozen|half|quarter|third|twice|double|triple|thrice)\b", re.IGNORECASE)
+
+# Ошибки первой попытки, после которых новые значения в исправлении означают выдумку.
+_INVENT_AFTER = ("NameError", "FileNotFoundError", "KeyError", "IndexError", "StopIteration")
+
+
+def is_symbol(name: str) -> bool:
+    """Обозначение величины из условия: одна буква (N, k), две с заглавной (T1, Nx) или слово целиком
+    заглавными. «a», «A», «i», «I» — обычные слова английского текста, а не обозначения."""
+    return bool(re.fullmatch(r"[A-Za-z]|[A-Z][A-Za-z0-9]|[A-Z][A-Z0-9_]+", name or "")) \
+        and name not in ("a", "A", "i", "I")
+
+
+def code_string_literals(code: str) -> list[str]:
+    """Строковые литералы кода (если код не разбирается — всё, что в кавычках)."""
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return [a or b for a, b in re.findall(r"'([^'\n]*)'|\"([^\"\n]*)\"", code)]
+    return [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def _numbers_in(text: str) -> set[float]:
+    found: set[float] = set()
+    for raw in re.findall(r"\d[\d,_]*(?:\.\d+)?", text or ""):
+        try:
+            found.add(float(raw.replace(",", "").replace("_", "")))
+        except ValueError:
+            pass
+    return found
+
+
+def invented_values(code: str, first_code: str, first: PotResult, context: str) -> list[str]:
+    """Значения, которые исправленный код ввёл после ошибки «нет такого имени/файла/ключа».
+
+    Считаются: присваивание литерала имени, на котором упала первая попытка (N = 0), и числа, которых
+    нет ни в условии и данных (`context`), ни в первой попытке, кроме обычных констант (_PLAIN_NUMBERS).
+    """
+    import ast
+
+    if first.ok or first.etype not in _INVENT_AFTER:
+        return []
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return []
+    found: list[str] = []
+    m = re.search(r"name '(\w+)' is not defined", first.error) if first.etype == "NameError" else None
+    if m and is_symbol(m.group(1)) and re.search(r"(?<![\w'])" + re.escape(m.group(1)) + r"(?![\w'])", context):
+        # имя из условия («N boxes»), а не забытая переменная самой модели (total = 0 — это исправление)
+        name = m.group(1)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                if any(isinstance(t, ast.Name) and t.id == name for t in targets) and value is not None \
+                        and _is_literal(value):
+                    found.append(f"{name} = {ast.unparse(value)[:40]}")
+    if _NUMBER_WORDS.search(context):
+        return found      # числа словами («three hundred») — новые литералы могут быть из условия
+    known = _numbers_in(context) | _numbers_in(first_code)
+    known |= {round(v / 100, 9) for v in known} | {round(v * 100, 9) for v in known}   # 15% -> 0.15
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            v = round(abs(float(node.value)), 9)
+            if v not in known and v not in _PLAIN_NUMBERS:
+                found.append(repr(node.value))
+    return found
+
+
+def _is_literal(node) -> bool:
+    import ast
+
+    try:
+        ast.literal_eval(node)
+        return True
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False

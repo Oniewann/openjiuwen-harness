@@ -2496,6 +2496,859 @@ def _bool_contradiction(rng, spec, names):
 _coding_variant("c_i_true_and_false_same_call", "hard", _c_inf(_bool_contradiction), "inf")
 
 
+# =========================================================================== P0-5: пересказы
+# Гипотезы p5_*: (а) тот же вопрос другими словами — эталон прежний; (б) одно слово меняет смысл
+# (except, at least, before, per, half, ...) — эталон пересчитан под новый смысл, а если его не
+# посчитать однозначно, kind = amb или inf. Навык на таких вопросах вправе отказаться; плохо только
+# WRONG (узнал формулировку неправильно) и STATIC.
+
+# --- math: операции как данные, чтобы считать и другие смыслы
+P5_START = [
+    "A warehouse starts with {n} boxes.", "A warehouse begins with {n} boxes.", "A warehouse has {n} boxes at the start.",
+    "At the start, a warehouse has {n} boxes.", "A warehouse initially has {n} boxes.",
+    "A warehouse initially holds {n} boxes.", "Initially, a warehouse contains {n} boxes.",
+    "There are {n} boxes in a warehouse.", "A warehouse starts out with {n} boxes.", "The warehouse starts with {n} boxes.",
+    "A warehouse starts with {n} boxes in stock.", "A warehouse starts the month with {n} boxes.",
+    "A warehouse has {n} boxes.", "A warehouse starts with a stock of {n} boxes.",
+    "A warehouse starts with exactly {n} boxes.", "A warehouse opens with {n} boxes.",
+]
+P5_SHIP = [
+    "It ships {a} boxes per day for {d} days.", "It ships {a} boxes each day for {d} days.",
+    "It ships {a} boxes a day for {d} days.", "It ships {a} boxes every day for {d} days.",
+    "It ships {a} boxes daily for {d} days.", "For {d} days, it ships {a} boxes per day.",
+    "Every day for {d} days, it ships {a} boxes.", "Over the next {d} days, it ships {a} boxes per day.",
+    "It sends out {a} boxes per day for {d} days.", "It ships out {a} boxes per day for {d} days.",
+    "During {d} days it ships {a} boxes per day.", "It ships {a} boxes per day over {d} days.",
+    "It ships {a} boxes per day for a period of {d} days.", "{a} boxes are shipped per day for {d} days.",
+    "It dispatches {a} boxes per day for {d} days.", "It ships {a} boxes per day, for {d} days.",
+    "It ships {a} boxes per day for {d} consecutive days.", "The warehouse ships {a} boxes per day for {d} days.",
+    "Then it ships {a} boxes per day for {d} days.", "Next, it ships {a} boxes per day for {d} days.",
+]
+P5_RECV = [
+    "It receives {k} deliveries of {m} boxes each.", "It receives {k} deliveries of {m} boxes apiece.",
+    "It gets {k} deliveries of {m} boxes each.", "It receives {k} shipments of {m} boxes each.",
+    "It receives {k} deliveries, each of {m} boxes.", "It receives {k} deliveries, each containing {m} boxes.",
+    "It receives {k} deliveries with {m} boxes in each.", "{k} deliveries of {m} boxes each arrive.",
+    "It takes in {k} deliveries of {m} boxes each.", "It receives {k} deliveries of {m} boxes per delivery.",
+    "The warehouse receives {k} deliveries of {m} boxes each.",
+    "It receives {k} deliveries of {m} boxes each, all on the same day.",
+    "Then {k} deliveries of {m} boxes each arrive at the warehouse.", "It is sent {k} deliveries of {m} boxes each.",
+    "Then it receives {k} deliveries of {m} boxes each.", "After that, it receives {k} deliveries of {m} boxes each.",
+]
+P5_SPLIT = [
+    "Then the stock is split equally into {k} warehouses and it keeps one share (rounded down).",
+    "Then the stock is divided equally into {k} warehouses and it keeps one share (rounded down).",
+    "Then the stock is split equally among {k} warehouses and it keeps one share (rounded down).",
+    "Then the stock is split evenly into {k} warehouses and it keeps one share (rounded down).",
+    "Then the stock is split into {k} equal shares and it keeps one share (rounded down).",
+    "Then the stock is split equally into {k} warehouses, and it keeps one share (rounded down).",
+    "Then the stock is split equally into {k} warehouses and it keeps one of the shares (rounded down).",
+    "Then the stock is split equally into {k} warehouses and the warehouse keeps one share (rounded down).",
+    "Then it splits the stock equally into {k} warehouses and keeps one share (rounded down).",
+    "Then the boxes are split equally into {k} warehouses and it keeps one share (rounded down).",
+    "Then the stock is split equally into {k} warehouses and it keeps a single share (rounded down).",
+    "Then the stock is split equally into {k} warehouses and it keeps one share, rounded down.",
+    "Then the stock is split equally into {k} warehouses and it keeps one share (rounding down).",
+    "Then the stock is split equally into {k} warehouses and it retains one share (rounded down).",
+    "Then the stock is split equally between {k} warehouses and it keeps one share (rounded down).",
+    "The stock is then split equally into {k} warehouses and it keeps one share (rounded down).",
+]
+P5_DOUBLE = [
+    "Then the stock is doubled by merging with a sister warehouse.", "Then the stock doubles by merging with a sister warehouse.",
+    "Then the stock is doubled after merging with a sister warehouse.",
+    "Then it merges with a sister warehouse and the stock is doubled.",
+    "Then the stock is doubled through a merger with a sister warehouse.", "Then the stock is doubled by a merge with a sister warehouse.",
+    "Then the number of boxes is doubled.", "Then the stock is doubled.", "Then the stock is multiplied by 2.",
+    "Then the stock is doubled by merging with another warehouse.", "Then its stock doubles.",
+    "The stock is then doubled by merging with a sister warehouse.", "Then the stock is doubled by merging with a twin warehouse.",
+    "Then the stock is doubled by merging with a sister warehouse of the same size.",
+]
+P5_QEND = [
+    "How many boxes does it have at the end?", "How many boxes does the warehouse have at the end?",
+    "At the end, how many boxes does it have?", "How many boxes are there at the end?",
+    "How many boxes does it have in the end?", "How many boxes does it have after all of this?",
+    "How many boxes does it have after these operations?", "How many boxes does it hold at the end?",
+    "How many boxes does it end with?", "How many boxes are in stock at the end?",
+    "How many boxes are left in the warehouse at the end?", "What is the number of boxes at the end?",
+    "What is the final number of boxes in the warehouse?", "How many boxes does it have at the end of all operations?",
+    "Determine how many boxes it has at the end.", "How many boxes does it finally have?",
+    "In the end, how many boxes are in the warehouse?", "How many boxes will the warehouse have at the end?",
+    "How many boxes remain in the warehouse at the end?", "How many boxes does the warehouse end up with?",
+    "What's the number of boxes at the end?", "Find how many boxes the warehouse has at the end.",
+    "How many boxes does it have when everything is done?", "How many boxes are in the warehouse after the last step?",
+]
+
+
+def _p5_ops(rng, n, count, kinds=("ship", "recv", "split", "double")):
+    """Случайная цепочка операций [(вид, параметры)] без ухода в минус; возвращает ops и значения после каждой."""
+    ops, vals, v = [], [], n
+    for _ in range(count):
+        kind = rng.choice(kinds)
+        if kind == "ship":
+            a, d = rng.randint(5, 40), rng.randint(2, 6)
+            while a * d > v and a > 1:
+                a = max(1, a // 2)
+            if a * d > v:
+                kind = "recv"
+            else:
+                ops.append(("ship", a, d))
+                v -= a * d
+        if kind == "recv":
+            k, m = rng.randint(2, 6), rng.randint(20, 120)
+            ops.append(("recv", k, m))
+            v += k * m
+        elif kind == "split":
+            k = rng.randint(2, 4)
+            ops.append(("split", k))
+            v //= k
+        elif kind == "double":
+            ops.append(("double",))
+            v *= 2
+        vals.append(v)
+    return ops, vals
+
+
+def _p5_apply(v, op):
+    if op[0] == "ship":
+        return v - op[1] * op[2]
+    if op[0] == "recv":
+        return v + op[1] * op[2]
+    if op[0] == "split":
+        return v // op[1]
+    return v * 2
+
+
+def _p5_run(n, ops):
+    for op in ops:
+        n = _p5_apply(n, op)
+    return n
+
+
+def _p5_render(rng, op, same=False):
+    """Предложение для операции: same=True — случайный пересказ, иначе формулировка из примеров."""
+    if op[0] == "ship":
+        return (rng.choice(P5_SHIP) if same else P5_SHIP[0]).format(a=op[1], d=op[2])
+    if op[0] == "recv":
+        return (rng.choice(P5_RECV) if same else P5_RECV[0]).format(k=op[1], m=op[2])
+    if op[0] == "split":
+        return (rng.choice(P5_SPLIT) if same else P5_SPLIT[0]).format(k=op[1])
+    return rng.choice(P5_DOUBLE) if same else P5_DOUBLE[0]
+
+
+def _p5_math_same(which):
+    """(а) Пересказ одной части задачи (или всех сразу), числа и смысл те же."""
+    def fn(rng):
+        n = rng.randint(800, 2400)
+        ops, vals = _p5_ops(rng, n, rng.randint(2, 4))
+        start = rng.choice(P5_START) if which in ("start", "all") else P5_START[0]
+        sents = [start.format(n=n)]
+        for op in ops:
+            sents.append(_p5_render(rng, op, same=which == "all" or which == op[0]))
+        q = rng.choice(P5_QEND) if which in ("q", "all") else QEND
+        return M(sents, vals[-1], q=q)
+    fn.__name__ = f"m_p5_same_{which}"
+    v("math", "base" if which != "all" else "easy")(fn)
+
+for _w in ("start", "ship", "recv", "split", "double", "q", "all"):
+    _p5_math_same(_w)
+
+
+@v("math", "mid")
+def m_p5_shift_question(rng):
+    """(б) Вопрос о другом моменте или другой величине: «at the start», «before the last», «per day», «in dozens»."""
+    n = rng.randint(800, 2400)
+    ops, vals = _p5_ops(rng, n, rng.randint(2, 4))
+    end = vals[-1]
+    sents = [P5_START[0].format(n=n)] + [_p5_render(rng, op) for op in ops]
+    ships = [op for op in ops if op[0] == "ship"]
+    recvs = [op for op in ops if op[0] == "recv"]
+    cand = [
+        ("How many boxes did it have at the start?", n), ("How many boxes did it have at the beginning?", n),
+        ("How many boxes did it have before the first operation?", n),
+        ("How many boxes did it have after the first operation?", vals[0]),
+        ("How many boxes did it have after the first step?", vals[0]),
+        ("How many boxes did it have before the last operation?", vals[-2] if len(vals) > 1 else n),
+        ("How many boxes did it have before the final step?", vals[-2] if len(vals) > 1 else n),
+        ("How many boxes does it have at the end, in dozens (rounded down)?", end // 12),
+        ("How many full dozens of boxes does it have at the end?", end // 12),
+        ("How many boxes does it have at the end, rounded down to the nearest hundred?", end // 100 * 100),
+        ("How many boxes does it have at the end, not counting 50 damaged boxes?", end - 50),
+        ("How many boxes does it have at the end, excluding 50 reserved boxes?", end - 50),
+        ("What is twice the number of boxes it has at the end?", 2 * end),
+        ("What is half the number of boxes it has at the end, rounded down?", end // 2),
+        (f"How many more boxes would it need to have {10 ** (len(str(end)))} boxes at the end?",
+         10 ** len(str(end)) - end),
+        ("How many boxes would it have at the end without the deliveries?",
+         _p5_run(n, [op for op in ops if op[0] != "recv"]) if recvs else None),
+        ("How many boxes would it have at the end if nothing had been shipped?",
+         _p5_run(n, [op for op in ops if op[0] != "ship"]) if ships else None),
+        ("How many boxes would it have at the end if the stock were not doubled?",
+         _p5_run(n, [op for op in ops if op[0] != "double"]) if any(op[0] == "double" for op in ops) else None),
+    ]
+    if len(ships) == 1:
+        a, d = ships[0][1], ships[0][2]
+        cand += [("How many boxes did it ship per day?", a), ("For how many days did it ship boxes?", d),
+                 ("How many boxes did it ship on average per day?", a),
+                 ("How many boxes did it ship in total, excluding the last day?", a * (d - 1)),
+                 ("How many boxes did it ship each day?", a), ("How many days did the shipping last?", d)]
+    if len(recvs) == 1:
+        k, m = recvs[0][1], recvs[0][2]
+        cand += [("How many deliveries did it receive?", k), ("How many boxes were in each delivery?", m),
+                 ("How many boxes did each delivery contain?", m),
+                 ("How many boxes did it receive per delivery?", m)]
+    cand = [(q, e) for q, e in cand if e is not None and e >= 0]
+    q, e = rng.choice(cand)
+    return M(sents, e, q=q)
+
+
+@v("math", "mid")
+def m_p5_shift_format_sentence(rng):
+    """(б) Обычный вопрос, но следом фраза о форме ответа, меняющая число («in dozens», «last digit»)."""
+    n = rng.randint(800, 2400)
+    ops, vals = _p5_ops(rng, n, rng.randint(2, 3))
+    end = vals[-1]
+    sents = [P5_START[0].format(n=n)] + [_p5_render(rng, op) for op in ops]
+    tail, e = rng.choice([
+        ("Give the answer as a number of dozens, rounded down.", end // 12),
+        ("Write only the last digit of the number.", end % 10),
+        ("Give the answer in hundreds, rounded down.", end // 100),
+        ("Write the number of full pallets of 40 boxes.", end // 40),
+        ("Report the number doubled.", end * 2),
+        ("Give the number of boxes minus the starting number.", end - n),
+        ("Write the answer as the number of boxes per warehouse if it is split into 2 (rounded down).", end // 2),
+        ("Answer with the number of hundreds only.", end // 100),
+    ])
+    if e < 0:
+        e = None
+    spec = M(sents + [QEND, tail], e, q=None)
+    if e is None:
+        spec["kind"] = "inf"
+    return spec
+
+
+@v("math", "mid")
+def m_p5_shift_operation(rng):
+    """(б) Одно слово в предложении-операции меняет арифметику: except, in total, twice, gives away, not ..."""
+    for _ in range(50):
+        n = rng.randint(800, 2400)
+        ops, _vals = _p5_ops(rng, n, rng.randint(2, 4))
+        i = rng.randrange(len(ops))
+        op = ops[i]
+        variants = []
+        if op[0] == "ship":
+            a, d = op[1], op[2]
+            r = rng.randint(1, max(1, a * d // 2))
+            variants = [
+                (f"It ships {a} boxes per day for {d} days, except on the last day.", ("ship", a, d - 1)),
+                (f"It ships {a} boxes in total over {d} days.", ("ship", a, 1)),
+                (f"It ships {a} boxes per day for {d} weeks.", ("ship", a, d * 7)),
+                (f"It ships twice {a} boxes per day for {d} days.", ("ship", 2 * a, d)),
+                (f"It ships {a} boxes per day for {d} days, but {r} of them are returned.", ("sub", a * d - r)),
+                (f"It does not ship {a} boxes per day for {d} days.", ("sub", 0)),
+                (f"It ships {a} boxes per day for {d} days, and then {r} more boxes.", ("sub", a * d + r)),
+                (f"It ships {a} boxes per day for half of {2 * d} days.", ("ship", a, d)),
+                (f"It ships {a} boxes per day for {d} days, twice.", ("ship", a, 2 * d)),
+                (f"It ships {a} boxes per day for {d} days except one day.", ("ship", a, d - 1)),
+                (f"It ships {a} boxes per day for the first {d} days only.", ("ship", a, d)),
+            ]
+        elif op[0] == "recv":
+            k, m = op[1], op[2]
+            variants = [
+                (f"It receives {k} deliveries of {m} boxes in total.", ("recv", 1, m)),
+                (f"It receives {k} deliveries totaling {m} boxes.", ("recv", 1, m)),
+                (f"It receives {k} deliveries of {m} boxes each, but one delivery is returned.", ("recv", k - 1, m)),
+                (f"It receives {k} deliveries of {m} boxes each, except the last one.", ("recv", k - 1, m)),
+                (f"It receives {k} deliveries of {m} boxes each, twice.", ("recv", 2 * k, m)),
+                (f"It receives {k} deliveries of {m} boxes per day for 3 days.", ("recv", 3 * k, m)),
+                (f"It receives {k} deliveries of half of {2 * m} boxes each.", ("recv", k, m)),
+                (f"It receives {k} deliveries of {m} boxes each, but not until next month.", ("sub", 0)),
+                (f"It receives {k} deliveries of {m} boxes each and sends one of them back.", ("recv", k - 1, m)),
+                (f"It does not receive {k} deliveries of {m} boxes each.", ("sub", 0)),
+            ]
+        elif op[0] == "split":
+            k = op[1]
+            variants = [
+                (f"Then the stock is split equally into {k} warehouses and it gives away one share (rounded down).", ("giveshare", k)),
+                (f"Then the stock is split equally into {k} warehouses and it keeps one share (rounded down), plus the leftover boxes.",
+                 ("keepleft", k)),
+                (f"Then the stock is split equally into {k} warehouses and it keeps two shares (rounded down).", ("keep2", k)),
+                (f"Then the stock is split equally into {k} warehouses and it keeps all but one share (each rounded down).",
+                 ("keepall1", k)),
+                (f"Then the stock is split equally into {k} warehouses and it keeps one share (rounded up).", ("splitup", k)),
+                (f"Then the stock is split equally into {k} more warehouses and it keeps one share (rounded down).", ("split", k + 1)),
+            ]
+        else:
+            variants = [
+                ("Then the stock is doubled twice.", ("mul", 4)),
+                ("Then the stock is doubled, then halved (rounded down).", ("mul", 1)),
+                ("Then the stock is not doubled.", ("mul", 1)),
+                ("Then the stock would be doubled by merging with a sister warehouse, but the merger is cancelled.", ("mul", 1)),
+                ("Then the stock is doubled by merging with a sister warehouse, twice.", ("mul", 4)),
+                ("Then the stock is tripled.", ("mul", 3)),
+                ("Then the stock is halved (rounded down) instead of doubled.", ("half",)),
+            ]
+        text, new = rng.choice(variants)
+        v_ = n
+        sents = [P5_START[0].format(n=n)]
+        ok = True
+        for j, o in enumerate(ops):
+            if j != i:
+                v_ = _p5_apply(v_, o)
+                sents.append(_p5_render(rng, o))
+                continue
+            sents.append(text)
+            t = new[0]
+            if t in ("ship", "recv"):
+                v_ = _p5_apply(v_, new)
+            elif t == "sub":
+                v_ -= new[1]
+            elif t == "giveshare":
+                v_ -= v_ // new[1]
+            elif t == "keepleft":
+                v_ = v_ // new[1] + v_ % new[1]
+            elif t == "keep2":
+                v_ = 2 * (v_ // new[1])
+            elif t == "keepall1":
+                v_ = (new[1] - 1) * (v_ // new[1])
+            elif t == "splitup":
+                v_ = -(-v_ // new[1])
+            elif t == "split":
+                v_ //= new[1]
+            elif t == "mul":
+                v_ *= new[1]
+            elif t == "half":
+                v_ //= 2
+            if v_ < 0:
+                ok = False
+        if ok:
+            return M(sents, v_)
+    raise RuntimeError("m_p5_shift_operation")
+
+
+@v("math", "mid")
+def m_p5_shift_order(rng):
+    """(б) «Before that, …»: предложение описывает более раннюю операцию — порядок счёта меняется."""
+    for _ in range(50):
+        n = rng.randint(800, 2400)
+        ops, _ = _p5_ops(rng, n, 3)
+        if not any(o[0] in ("split", "double") for o in ops):
+            continue
+        i = rng.randint(1, 2)
+        real = ops[:i - 1] + [ops[i], ops[i - 1]] + ops[i + 1:]
+        val, bad = n, False
+        for o in real:
+            val = _p5_apply(val, o)
+            bad = bad or val < 0
+        if bad:
+            continue
+        sents = [P5_START[0].format(n=n)]
+        for j, o in enumerate(ops):
+            s = _p5_render(rng, o)
+            if j == i:
+                body = s[len("Then "):] if s.startswith("Then ") else s
+                s = rng.choice(["Before that, ", "But before that, ", "Earlier, "]) + body[0].lower() + body[1:]
+            sents.append(s)
+        return M(sents, val)
+    raise RuntimeError("m_p5_shift_order")
+
+
+@v("math", "mid", "amb")
+def m_p5_shift_place(rng):
+    """(б) Операция в другом месте: «from the other warehouse», «in the sister warehouse» — наш запас не меняется."""
+    n = rng.randint(800, 2400)
+    ops, vals = _p5_ops(rng, n, 2, kinds=("ship", "recv"))
+    sents = [P5_START[0].format(n=n)] + [_p5_render(rng, op) for op in ops]
+    a = rng.randint(10, 90)
+    sents.insert(rng.randint(1, len(sents)), rng.choice([
+        f"It ships {a} boxes from the other warehouse.", f"It sells {a} boxes from a sister warehouse.",
+        f"It loses {a} boxes in the sister warehouse.", "Then the stock is doubled in the other warehouse.",
+        f"It ships {a} boxes from a second warehouse."]))
+    return M(sents, vals[-1])
+
+
+@v("math", "mid", "amb")
+def m_p5_probe(rng):
+    """Найденные пробами формулировки: «did it have?» без момента, «items» вместо boxes, буква вместо числа."""
+    n = rng.randint(800, 2400)
+    ops, vals = _p5_ops(rng, n, 2, kinds=("ship", "recv"))
+    sents = [P5_START[0].format(n=n)] + [_p5_render(rng, op) for op in ops]
+    q, e = rng.choice([("How many boxes did it have?", None), ("How many items does it have at the end?", vals[-1]),
+                       ("How many units does the warehouse have at the end?", vals[-1])])
+    if rng.random() < 0.3:
+        sents.append(f"It ships {rng.choice('XNk')} boxes per day for 3 days.")
+        e = None
+    return M(sents, e, q=q)
+
+
+@v("math", "mid", "inf")
+def m_p5_shift_inexact(rng):
+    """(б) «at least», «at most», «more than», «up to» — число перестаёт быть точным: ответа нет."""
+    n = rng.randint(800, 2400)
+    ops, _ = _p5_ops(rng, n, 2, kinds=("ship", "recv"))
+    sents = [P5_START[0].format(n=n)] + [_p5_render(rng, op) for op in ops]
+    a, d = rng.randint(5, 30), rng.randint(2, 5)
+    w = rng.choice(["at least", "at most", "more than", "fewer than", "up to", "about", "nearly", "over", "under"])
+    sents.append(rng.choice([f"It ships {w} {a} boxes per day for {d} days.", f"It receives {w} {a} boxes.",
+                             f"It ships {a} boxes per day for {w} {d} days."]))
+    return M(sents, None)
+
+
+# --- search
+P5_S_SAME = {
+    "born": ["In which year was {p} born?", "What year was {p} born in?", "{p} was born in what year?",
+             "Which year was {p} born in?", "In what year was {p} born?", "What is the year of birth of {p}?",
+             "What is {p}'s birth year?", "Tell me the year {p} was born.", "Can you find the year in which {p} was born?",
+             "What year did {p} come into the world?", "Born in which year: {p}?", "When was {p} born (year)?",
+             "Which year is {p}'s year of birth?", "What birth year is recorded for {p}?"],
+    "employer": ["Which company does {p} work for?", "Who employs {p}?", "For which company does {p} work?",
+                 "What company does {p} work at?", "Which company is {p} employed at?", "Where is {p} employed?",
+                 "Which company is the employer of {p}?", "Name the company that employs {p}.",
+                 "What is the name of {p}'s employer?", "At which company does {p} work?", "{p} works for which company?"],
+    "mentor": ["Who is the mentor of {p}?", "Who mentors {p}?", "Who is {p} mentored by?", "Who acts as {p}'s mentor?",
+               "Name the mentor of {p}.", "Which person is {p}'s mentor?", "{p}'s mentor is who?",
+               "Who serves as the mentor of {p}?", "Who is the person mentoring {p}?"],
+    "employer_hq": ["In which city is the headquarters of {p}'s employer?", "Where is {p}'s employer headquartered?",
+                    "In which city is the company that {p} works for headquartered?",
+                    "What city is {p}'s employer headquartered in?", "Which city is home to {p}'s employer's headquarters?",
+                    "In what city does {p}'s employer have its headquarters?",
+                    "The company {p} works for is headquartered in which city?",
+                    "Where are the headquarters of {p}'s employer?", "In which city is {p}'s company headquartered?"],
+    "mentor_born": ["In which year was {p}'s mentor born?", "What year was the mentor of {p} born?",
+                    "When was {p}'s mentor born?", "In what year was the person who mentors {p} born?",
+                    "What is the birth year of {p}'s mentor?", "{p}'s mentor was born in which year?"],
+    "founded": ["In which year was {c} founded?", "When was {c} established?", "What year was {c} founded in?",
+                "In what year was {c} established?", "What is the founding year of {c}?", "When did {c} get founded?",
+                "{c} was founded in which year?", "In which year was the company {c} founded?"],
+}
+
+
+def _p5_search_same(key, getter):
+    def fn(rng):
+        people, comps = build_kb(rng)
+        p = _pick(rng, people)
+        c = people[p]["Employer"]
+        return SQ(rng.choice(P5_S_SAME[key]).format(p=p, c=c), getter(p, c, people, comps), people, comps)
+    fn.__name__ = f"s_p5_same_{key}"
+    v("search", "easy")(fn)
+
+_p5_search_same("born", lambda p, c, P, C: P[p]["Born"])
+_p5_search_same("employer", lambda p, c, P, C: P[p]["Employer"])
+_p5_search_same("mentor", lambda p, c, P, C: P[p]["Mentor"])
+_p5_search_same("employer_hq", lambda p, c, P, C: C[c]["Headquarters"])
+_p5_search_same("mentor_born", lambda p, c, P, C: P[P[p]["Mentor"]]["Born"])
+_p5_search_same("founded", lambda p, c, P, C: C[c]["Founded"])
+
+
+def _uniq(xs):
+    return xs[0] if len(xs) == 1 else None
+
+
+@v("search", "mid")
+def s_p5_shift(rng):
+    """(б) Одно слово меняет смысл: other than, same year, oldest at, years after, last two digits..."""
+    for _ in range(80):
+        people, comps = build_kb(rng)
+        p = _pick(rng, people)
+        c = people[p]["Employer"]
+        m = people[p]["Mentor"]
+        y = people[p]["Born"]
+        q2 = rng.choice([x for x in people if x != p])
+        mentees = [x for x in people if people[x]["Mentor"] == m and x != p]
+        colleagues = [x for x in people if people[x]["Employer"] == c and x != p]
+        same_year = [x for x in people if people[x]["Born"] == y and x != p]
+        at_c = sorted((people[x]["Born"], x) for x in people if people[x]["Employer"] == c)
+        oldest_c = at_c[0][1] if len(at_c) > 1 and at_c[0][0] != at_c[1][0] else None
+        youngest_c = at_c[-1][1] if len(at_c) > 1 and at_c[-1][0] != at_c[-2][0] else None
+        cand = [
+            (f"Who else is mentored by {p}'s mentor besides {p}?", _uniq(mentees)),
+            (f"Who, other than {p}, has {m} as a mentor?", _uniq(mentees)),
+            (f"Who works at the same company as {p}?", _uniq(colleagues)),
+            (f"Who else works for {p}'s employer?", _uniq(colleagues)),
+            (f"Who was born in the same year as {p}?", _uniq(same_year)),
+            (f"Who is the oldest person working at {c}?", oldest_c),
+            (f"Who is the youngest employee of {c}?", youngest_c),
+            (f"How many years after {p} was {q2} born?", people[q2]["Born"] - y if people[q2]["Born"] > y else None),
+            (f"How many years before {q2} was {p} born?", people[q2]["Born"] - y if people[q2]["Born"] > y else None),
+            (f"How many years older is {p}'s mentor than {p}?", y - people[m]["Born"] if people[m]["Born"] < y else None),
+            (f"In which year was {p} born? Answer with the last two digits only.", f"{y % 100:02d}"),
+            (f"In which year was {p} born? Give the year minus 1900.", y - 1900),
+            (f"What is the birth year of {p} plus ten?", y + 10),
+            (f"In which year did {p} turn 30?", y + 30),
+            (f"In which year will {p} turn 65?", y + 65),
+            (f"Who was born earlier, {p} or {q2}'s mentor?",
+             (p if y < people[people[q2]["Mentor"]]["Born"] else people[q2]["Mentor"])
+             if y != people[people[q2]["Mentor"]]["Born"] and people[q2]["Mentor"] != p else None),
+            (f"Who is older, {p}'s mentor or {q2}?",
+             (m if people[m]["Born"] < people[q2]["Born"] else q2)
+             if people[m]["Born"] != people[q2]["Born"] and m != q2 else None),
+            (f"In which year was {c} founded? Answer with the number of years before 2025.", 2025 - comps[c]["Founded"]),
+            (f"Which company does {p}'s mentor work for, if not {c}?",
+             people[m]["Employer"] if people[m]["Employer"] != c else None),
+        ]
+        cand = [(q, e) for q, e in cand if e is not None]
+        if cand:
+            q, e = rng.choice(cand)
+            return SQ(q, e, people, comps)
+    raise RuntimeError("s_p5_shift")
+
+
+@v("search", "mid")
+def s_p5_plausible(rng):
+    """Правдоподобные «новые» вопросы финала по той же базе: другие пути, сравнения, подсчёты."""
+    for _ in range(80):
+        people, comps = build_kb(rng)
+        p = _pick(rng, people)
+        c = people[p]["Employer"]
+        m = people[p]["Mentor"]
+        q2 = rng.choice([x for x in people if x != p])
+        at_c = sorted((people[x]["Born"], x) for x in people if people[x]["Employer"] == c)
+        cand = [
+            (f"What is the founding year of {p}'s employer?", comps[c]["Founded"]),
+            (f"In which city is {p}'s mentor's employer located?", comps[people[m]["Employer"]]["Headquarters"]),
+            (f"Where is {p}'s employer located?", comps[c]["Headquarters"]),
+            (f"What city is {c} based in?", comps[c]["Headquarters"]),
+            (f"Who is {p}'s employer?", c),
+            (f"When was {p}'s mentor born?", people[m]["Born"]),
+            (f"Who was born earlier: {p} or {q2}?",
+             (p if people[p]["Born"] < people[q2]["Born"] else q2) if people[p]["Born"] != people[q2]["Born"] else None),
+            (f"Is {p} older than {q2}? Answer yes or no.",
+             ("yes" if people[p]["Born"] < people[q2]["Born"] else "no") if people[p]["Born"] != people[q2]["Born"] else None),
+            (f"How old was {p} when {c} was founded?", comps[c]["Founded"] - people[p]["Born"]
+             if comps[c]["Founded"] > people[p]["Born"] else None),
+            (f"Who is the youngest person working at {c}?",
+             at_c[-1][1] if len(at_c) > 1 and at_c[-1][0] != at_c[-2][0] else None),
+            (f"Which company employs {p}'s mentor?", people[m]["Employer"]),
+            (f"What is the name of the company where {p} works?", c),
+            (f"In which year was the company that employs {p}'s mentor founded?", comps[people[m]["Employer"]]["Founded"]),
+            (f"Who mentors {p}'s mentor?", people[m]["Mentor"]),
+            (f"Does {p} work at {c}? Answer yes or no.", "yes"),
+            (f"How many people does {c} employ?", sum(1 for x in people.values() if x["Employer"] == c)),
+            (f"In which city does {p}'s mentor work?", comps[people[m]["Employer"]]["Headquarters"]),
+        ]
+        cand = [(q, e) for q, e in cand if e is not None]
+        q, e = rng.choice(cand)
+        return SQ(q, e, people, comps)
+    raise RuntimeError("s_p5_plausible")
+
+
+@v("search", "mid")
+def s_p5_probe(rng):
+    """Найденные пробами формулировки: сравнение с описанием вместо имени, двойной вопрос, «located»."""
+    for _ in range(80):
+        people, comps = build_kb(rng)
+        p = _pick(rng, people)
+        m = people[p]["Mentor"]
+        c = people[p]["Employer"]
+        cand = [
+            (f"Who was born earlier, {p} or {p.split()[0]}'s mentor?",
+             (p if people[p]["Born"] < people[m]["Born"] else m) if people[p]["Born"] != people[m]["Born"] else None, "ok"),
+            (f"In which year was {p} born, and who is the mentor?", f"{people[p]['Born']}, {m}", "amb"),
+            (f"Where is {p}'s employer located?", comps[c]["Headquarters"], "ok"),
+            (f"What is the city of {p}'s employer?", comps[c]["Headquarters"], "ok"),
+            (f"Which city is {p}'s employer in?", comps[c]["Headquarters"], "ok"),
+        ]
+        cand = [x for x in cand if x[1] is not None]
+        q, e, k = rng.choice(cand)
+        spec = SQ(q, e, people, comps)
+        spec["kind"] = k
+        return spec
+    raise RuntimeError("s_p5_probe")
+
+
+@v("search", "mid", "inf")
+def s_p5_shift_inf(rng):
+    """(б) Слово про то, чего в базе нет: previous/next/first/former, place of birth, since when..."""
+    people, comps = build_kb(rng)
+    p = _pick(rng, people)
+    c = people[p]["Employer"]
+    q = rng.choice([
+        f"Which company did {p} work for before {c}?", f"Who was {p}'s previous mentor?",
+        f"Who will be {p}'s next mentor?", f"Who was {p}'s first employer?", f"What was {p}'s former employer?",
+        f"In which city was {p} born?", f"Where was {p} born?", f"Since which year has {p} worked at {c}?",
+        f"In which year did {p} join {c}?", f"Until which year did {p} work at {c}?",
+        f"Who is not {p}'s mentor?", f"Which company does {p} not work for?",
+        f"In which city is {p}'s employer not headquartered?", f"Who mentored {p} after {people[p]['Mentor']}?",
+        f"Who is the mentor of {p}'s employer?", f"In which year was {p}'s employer born?",
+        f"Who founded {c}?", f"How many employees does {c} have in total worldwide?",
+        f"What is {p}'s job title?", f"In which year did {p} graduate?",
+    ])
+    return SQ(q, None, people, comps)
+
+
+# --- data_analysis
+P5_D_SAME = [
+    "How many units of product '{p}' were sold in months {lo} through {hi} inclusive?",
+    "What was the total number of units of product '{p}' sold in months {lo} through {hi} inclusive?",
+    "How many units of product '{p}' were sold during months {lo} through {hi} inclusive?",
+    "How many units of product '{p}' were sold in months {lo} to {hi} inclusive?",
+    "How many units of product '{p}' were sold from month {lo} through month {hi} inclusive?",
+    "How many units of product '{p}' were sold between month {lo} and month {hi} inclusive?",
+    "How many units of product '{p}' were sold between months {lo} and {hi}, inclusive?",
+    "How many units of product '{p}' were sold in months {lo}-{hi} inclusive?",
+    "Across months {lo} through {hi} inclusive, how many units of product '{p}' were sold?",
+    "How many units did product '{p}' sell in months {lo} through {hi} inclusive?",
+    "How many units of '{p}' were sold in months {lo} through {hi} inclusive?",
+    "How many units of the product '{p}' were sold in months {lo} through {hi} inclusive?",
+    "What is the total units of product '{p}' sold in months {lo} through {hi} inclusive?",
+    "What is the sum of units of product '{p}' in months {lo} through {hi} inclusive?",
+    "In total, how many units of product '{p}' were sold in months {lo} through {hi} inclusive?",
+    "How many units of product '{p}' were sold in months {lo} through {hi} (both inclusive)?",
+    "Total units of product '{p}' sold in months {lo} through {hi} inclusive?",
+    "How many units were sold for product '{p}' in months {lo} through {hi} inclusive?",
+    "How many units of product '{p}' have been sold in months {lo} through {hi} inclusive?",
+    "How many total units of product '{p}' were sold in months {lo} through {hi} inclusive?",
+    "Calculate the number of units of product '{p}' sold in months {lo} through {hi} inclusive.",
+    "How many units of product '{p}' were sold where month is between {lo} and {hi} inclusive?",
+    "How many units of product '{p}' were sold with month from {lo} to {hi} inclusive?",
+    "How many units of product '{p}' were sold in the months {lo} through {hi} inclusive?",
+    "How many units of product '{p}' were sold in months {lo} through {hi}, both months included?",
+    "Over months {lo} through {hi} inclusive, how many units of product '{p}' were sold in total?",
+    "How many units of product '{p}' were sold in month {lo} through month {hi} inclusive?",
+]
+
+
+@v("data_analysis", "easy")
+def d_p5_same(rng):
+    rows = sales(rng)
+    p, lo, hi = _pm(rng)
+    e = sum(r["units"] for r in rows if r["product"] == p and lo <= r["month"] <= hi)
+    return DQ(rng.choice(P5_D_SAME).format(p=p, lo=lo, hi=hi), e, rows)
+
+
+@v("data_analysis", "easy")
+def d_p5_same_region(rng):
+    rows = sales(rng)
+    _, lo, hi = _pm(rng)
+    g = rng.choice(REGIONS)
+    e = sum(r["units"] for r in rows if r["region"] == g and lo <= r["month"] <= hi)
+    q = rng.choice([
+        "How many units were sold in region '{g}' in months {lo} through {hi} inclusive?",
+        "How many units were sold in the '{g}' region in months {lo} through {hi} inclusive?",
+        "What is the total number of units sold in region '{g}' during months {lo} through {hi} inclusive?",
+        "In region '{g}', how many units were sold in months {lo} through {hi} inclusive?",
+        "How many units did region '{g}' sell in months {lo} through {hi} inclusive?",
+        "How many units were sold within region '{g}' in months {lo} to {hi} inclusive?",
+        "For region '{g}', what is the total of units sold in months {lo} through {hi} inclusive?",
+        "How many units were sold in months {lo} through {hi} inclusive in region '{g}'?",
+    ])
+    return DQ(q.format(g=g, lo=lo, hi=hi), e, rows)
+
+
+def _p5_units(rows, pred):
+    return sum(r["units"] for r in rows if pred(r))
+
+
+@v("data_analysis", "mid")
+def d_p5_shift(rng):
+    """(б) Одно слово меняет фильтр или меру: excluding, other than, exclusive, first N, at least, per order..."""
+    for _ in range(80):
+        rows = sales(rng)
+        p, lo, hi = _pm(rng)
+        if hi - lo < 2:
+            hi = min(12, lo + 2)
+            if hi - lo < 2:
+                lo = hi - 2
+        g = rng.choice(REGIONS)
+        c = rng.randint(lo + 1, hi - 1)
+        t = rng.randint(10, 40)
+        nfirst = rng.randint(2, 6)
+        P = lambda r: r["product"] == p  # noqa: E731
+        R = lambda r: lo <= r["month"] <= hi  # noqa: E731
+        base = f"How many units of product '{p}' were sold"
+        sel = [r for r in rows if P(r) and R(r)]
+        sel_p = [r for r in rows if P(r)]
+        monthly = {mm: _p5_units(rows, lambda r, mm=mm: P(r) and r["month"] == mm) for mm in range(lo, hi + 1)}
+        cand = [
+            (f"{base} in months {lo} through {hi} inclusive, excluding month {c}?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["month"] != c), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive except month {c}?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["month"] != c), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, but not in month {c}?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["month"] != c), "ok"),
+            (f"{base} in months other than {lo} through {hi}?", _p5_units(rows, lambda r: P(r) and not R(r)), "ok"),
+            (f"{base} outside months {lo} through {hi}?", _p5_units(rows, lambda r: P(r) and not R(r)), "ok"),
+            (f"{base} between months {lo} and {hi} exclusive?", _p5_units(rows, lambda r: P(r) and lo < r["month"] < hi), "ok"),
+            (f"{base} strictly between months {lo} and {hi}?", _p5_units(rows, lambda r: P(r) and lo < r["month"] < hi), "ok"),
+            (f"{base} between months {lo} and {hi}?", _p5_units(rows, lambda r: P(r) and R(r)), "amb"),
+            (f"{base} since month {lo}?", _p5_units(rows, lambda r: P(r) and r["month"] >= lo), "amb"),
+            (f"{base} until month {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] <= hi), "amb"),
+            (f"{base} up to month {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] <= hi), "amb"),
+            (f"{base} in the first {nfirst} months?", _p5_units(rows, lambda r: P(r) and r["month"] <= nfirst), "ok"),
+            (f"{base} in the last {nfirst} months?", _p5_units(rows, lambda r: P(r) and r["month"] > 12 - nfirst), "ok"),
+            (f"{base} in the first half of the year?", _p5_units(rows, lambda r: P(r) and r["month"] <= 6), "ok"),
+            (f"{base} in the second half of the year?", _p5_units(rows, lambda r: P(r) and r["month"] >= 7), "ok"),
+            (f"{base} in the month after month {lo}?", _p5_units(rows, lambda r: P(r) and r["month"] == lo + 1), "ok"),
+            (f"{base} in the month before month {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] == hi - 1), "ok"),
+            (f"{base} in the next month after month {lo}?", _p5_units(rows, lambda r: P(r) and r["month"] == lo + 1), "ok"),
+            (f"{base} in the previous month to month {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] == hi - 1), "ok"),
+            (f"{base} in months {lo} and {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] in (lo, hi)), "ok"),
+            (f"{base} in month {lo} and month {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] in (lo, hi)), "ok"),
+            (f"{base} in months {lo} or {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] in (lo, hi)), "ok"),
+            (f"{base} in months {lo}, {c} and {hi}?", _p5_units(rows, lambda r: P(r) and r["month"] in (lo, c, hi)), "ok"),
+            (f"How many units of products other than '{p}' were sold in months {lo} through {hi} inclusive?",
+             _p5_units(rows, lambda r: not P(r) and R(r)), "ok"),
+            (f"How many units of all products except '{p}' were sold in months {lo} through {hi} inclusive?",
+             _p5_units(rows, lambda r: not P(r) and R(r)), "ok"),
+            (f"How many units besides product '{p}' were sold in months {lo} through {hi} inclusive?",
+             _p5_units(rows, lambda r: not P(r) and R(r)), "ok"),
+            (f"How many units, excluding product '{p}', were sold in months {lo} through {hi} inclusive?",
+             _p5_units(rows, lambda r: not P(r) and R(r)), "ok"),
+            (f"How many units not of product '{p}' were sold in months {lo} through {hi} inclusive?",
+             _p5_units(rows, lambda r: not P(r) and R(r)), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive outside region '{g}'?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["region"] != g), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, without region '{g}'?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["region"] != g), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive except in region '{g}'?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["region"] != g), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive only in region '{g}'?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["region"] == g), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive in orders with at least {t} units?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["units"] >= t), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive in orders of at most {t} units?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["units"] <= t), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive in orders with more than {t} units?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["units"] > t), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive in orders with fewer than {t} units?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["units"] < t), "ok"),
+            (f"How many orders of product '{p}' were there in months {lo} through {hi} inclusive?", len(sel), "ok"),
+            (f"How many orders of product '{p}' had at least {t} units in months {lo} through {hi} inclusive?",
+             sum(1 for r in sel if r["units"] >= t), "ok"),
+            (f"What is the average number of units per order of product '{p}' in months {lo} through {hi} inclusive, "
+             f"rounded down to an integer?", sum(r["units"] for r in sel) // len(sel) if sel else None, "ok"),
+            (f"How many units of product '{p}' were sold per month on average in months {lo} through {hi} inclusive, "
+             f"rounded down to an integer?", sum(monthly.values()) // len(monthly), "ok"),
+            (f"How many units of product '{p}' were sold per order in months {lo} through {hi} inclusive, "
+             f"rounded down to an integer?", sum(r["units"] for r in sel) // len(sel) if sel else None, "amb"),
+            (f"What is twice the number of units of product '{p}' sold in months {lo} through {hi} inclusive?",
+             2 * sum(r["units"] for r in sel), "ok"),
+            (f"What is half the number of units of product '{p}' sold in months {lo} through {hi} inclusive, "
+             f"rounded down to an integer?", sum(r["units"] for r in sel) // 2, "ok"),
+            (f"How many units were in the first order of product '{p}'?", sel_p[0]["units"] if sel_p else None, "ok"),
+            (f"How many units were in the last order of product '{p}'?", sel_p[-1]["units"] if sel_p else None, "ok"),
+            (f"What is the units value of the first order of product '{p}' in months {lo} through {hi} inclusive?",
+             sel[0]["units"] if sel else None, "ok"),
+            (f"What is the maximum number of units of product '{p}' sold in a single month in months {lo} through {hi} "
+             f"inclusive?", max(monthly.values()), "ok"),
+            (f"What is the maximum units of product '{p}' sold per month in months {lo} through {hi} inclusive?",
+             max(monthly.values()), "ok"),
+            (f"In how many distinct months of months {lo} through {hi} inclusive was product '{p}' sold?",
+             sum(1 for x in monthly.values() if x), "ok"),
+            (f"How many more units of product '{p}' were sold in month {hi} than in month {lo}?",
+             monthly[hi] - monthly[lo] if monthly[hi] > monthly[lo] else None, "ok"),
+            (f"{base} in month {lo} only?", monthly[lo], "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, at a price of at most {t + 30}?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["price"] <= t + 30), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, at a price below {t + 30}?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["price"] < t + 30), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, excluding orders with more than {t} units?",
+             _p5_units(rows, lambda r: P(r) and R(r) and r["units"] <= t), "ok"),
+            (f"{base} in months {lo} through {hi} inclusive, excluding the order with the most units?",
+             (sum(r["units"] for r in sel) - max(r["units"] for r in sel)) if sel else None, "amb"),
+        ]
+        cand = [(q, e, k) for q, e, k in cand if e is not None]
+        q, e, k = rng.choice(cand)
+        spec = DQ(q, e, rows)
+        spec["kind"] = k
+        return spec
+    raise RuntimeError("d_p5_shift")
+
+
+@v("data_analysis", "mid")
+def d_p5_plausible(rng):
+    """Правдоподобные «новые» вопросы финала по той же таблице: другие меры, фильтры и их сочетания."""
+    for _ in range(80):
+        rows = sales(rng)
+        p, lo, hi = _pm(rng)
+        g = rng.choice(REGIONS)
+        t = rng.randint(10, 40)
+        pr = rng.randint(30, 70)
+        sel_p = [r for r in rows if r["product"] == p]
+        sel_g = [r for r in rows if r["region"] == g]
+        sel_pg = [r for r in sel_p if r["region"] == g]
+        sel_pm = [r for r in sel_p if lo <= r["month"] <= hi]
+        rev = lambda rs: sum(r["units"] * r["price"] for r in rs)  # noqa: E731
+        cand = [
+            (f"What is the average price of product '{p}'?", repr(sum(r["price"] for r in sel_p) / len(sel_p)) if sel_p else None, "amb"),
+            (f"What is the total revenue (units times price) of product '{p}' in region '{g}'?", rev(sel_pg), "ok"),
+            (f"What is the total revenue (units times price) of product '{p}' in months {lo} through {hi} inclusive?", rev(sel_pm), "ok"),
+            (f"How many orders in region '{g}' have more than {t} units?", sum(1 for r in sel_g if r["units"] > t), "ok"),
+            (f"How many orders in region '{g}' have a price above {pr}?", sum(1 for r in sel_g if r["price"] > pr), "ok"),
+            (f"What is the highest price paid for product '{p}' in region '{g}'?", max((r["price"] for r in sel_pg), default=None), "ok"),
+            (f"What is the lowest number of units in a single order in region '{g}'?", min((r["units"] for r in sel_g), default=None), "ok"),
+            (f"How many units of product '{p}' were sold in region '{g}'?", sum(r["units"] for r in sel_pg), "ok"),
+            (f"How many orders of product '{p}' were placed in region '{g}'?", len(sel_pg), "ok"),
+            (f"What is the total number of units sold in region '{g}' with a price of at least {pr}?",
+             sum(r["units"] for r in sel_g if r["price"] >= pr), "ok"),
+            (f"What is the sum of prices of product '{p}'?", sum(r["price"] for r in sel_p), "amb"),
+            (f"What is the total units for product '{p}' where price is below {pr}?",
+             sum(r["units"] for r in sel_p if r["price"] < pr), "ok"),
+            (f"How many units of product '{p}' were sold in orders with more than {t} units?",
+             sum(r["units"] for r in sel_p if r["units"] > t), "ok"),
+            (f"What is the average number of units per order in region '{g}', rounded to the nearest integer?",
+             round(sum(r["units"] for r in sel_g) / len(sel_g)) if sel_g and (2 * sum(r["units"] for r in sel_g)) % len(sel_g) else None, "ok"),
+            (f"What is the maximum revenue (units times price) of a single order of product '{p}'?",
+             max((r["units"] * r["price"] for r in sel_p), default=None), "ok"),
+            (f"What is the total revenue (units times price) of orders with more than {t} units?",
+             rev([r for r in rows if r["units"] > t]), "ok"),
+            (f"How many orders were placed in months {lo} through {hi} inclusive?",
+             sum(1 for r in rows if lo <= r["month"] <= hi), "ok"),
+            (f"What is the total number of units of product '{p}' sold in region '{g}' in months {lo} through {hi} inclusive?",
+             sum(r["units"] for r in sel_pg if lo <= r["month"] <= hi), "ok"),
+            (f"How many units were sold in total across all regions except '{g}'?",
+             sum(r["units"] for r in rows if r["region"] != g), "ok"),
+            (f"How many units of product '{p}' were sold, on average, per order?",
+             None, "inf"),
+        ]
+        cand = [(q, e, k) for q, e, k in cand if e is not None or k == "inf"]
+        q, e, k = rng.choice(cand)
+        spec = DQ(q, e, rows, check="exact_str" if isinstance(e, str) else "exact_int")
+        if k == "inf":
+            spec["expected"] = None
+            k = "amb"
+        spec["kind"] = k
+        return spec
+    raise RuntimeError("d_p5_plausible")
+
+
+@v("data_analysis", "mid")
+def d_p5_probe(rng):
+    """Найденные пробами формулировки: форма слова-столбца («priced»), значение вместо столбца, «exactly»."""
+    rows = sales(rng)
+    p = rng.choice(PRODUCTS)
+    t = rng.randint(20, 60)
+    u = rng.randint(5, 40)
+    q, e = rng.choice([
+        (f"What is the total units of orders priced under {t}?", sum(r["units"] for r in rows if r["price"] < t)),
+        (f"How many {p} units were sold?", sum(r["units"] for r in rows if r["product"] == p)),
+        (f"What is the units total for {p}?", sum(r["units"] for r in rows if r["product"] == p)),
+        (f"How many orders had exactly {u} units?", sum(1 for r in rows if r["units"] == u)),
+        (f"How many units of product '{p}' were sold in months 3 and 4?", sum(r["units"] for r in rows if r["product"] == p and r["month"] in (3, 4))),
+    ])
+    return DQ(q, e, rows)
+
+
+@v("data_analysis", "mid", "inf")
+def d_p5_shift_inf(rng):
+    """(б) Вопрос, на который в таблице нет ответа: each/per region (много чисел), next year, returned, unsold."""
+    rows = sales(rng)
+    p, lo, hi = _pm(rng)
+    g = rng.choice(REGIONS)
+    q = rng.choice([
+        f"How many units of product '{p}' were sold in each month from {lo} to {hi}?",
+        f"How many units of product '{p}' were sold in months {lo} through {hi} inclusive, per region?",
+        f"How many units of product '{p}' remain unsold?",
+        f"How many units of product '{p}' were returned in months {lo} through {hi} inclusive?",
+        f"How many units of product '{p}' were sold in months {lo} through {hi} inclusive in the previous year?",
+        f"How many units of product '{p}' will be sold in months {lo} through {hi} next year?",
+        f"How many units of product '{p}' were not sold in months {lo} through {hi} inclusive?",
+        f"How many units of each product were sold in region '{g}'?",
+        f"How many units of product '{p}' were sold in months {lo} through {hi} inclusive by each salesperson?",
+        f"How many units of product '{p}' were sold in week {lo}?",
+    ])
+    return DQ(q, None, rows)
+
+
 # =========================================================================== сборка
 def generate(out: Path, per: int, seed: int, only: set, match: str, levels: set) -> dict:
     if out.exists():

@@ -86,10 +86,31 @@ try:
             if __lines:
                 __val = __lines[-1].strip()
     else:
+        # Как интерактивный Python: если последний оператор — выражение («import statistics;
+        # statistics.median(xs)»), его значение и есть ответ. Иначе — последняя строка вывода.
+        import ast as __ast
+        __last = None
+        try:
+            __tree = __ast.parse(__code, "<answer>", "exec")
+            if len(__tree.body) > 1 and isinstance(__tree.body[-1], __ast.Expr):
+                __expr = __ast.Expression(__tree.body.pop().value)
+                __head = compile(__tree, "<answer>", "exec")
+                __last = compile(__expr, "<answer>", "eval")
+                __compiled = __head
+        except (SyntaxError, ValueError, TypeError):
+            __last = None
+        __tail = None
         with contextlib.redirect_stdout(__buf):
             exec(__compiled, globals())
+            __printed = len(__buf.getvalue())
+            if __last is not None:
+                __tail = eval(__last, globals())
         __lines = [ln for ln in __buf.getvalue().splitlines() if ln.strip()]
-        if __lines:
+        # Последнее выражение само что-то напечатало (main(), который печатает и возвращает 0) —
+        # ответом остаётся напечатанное.
+        if __tail is not None and len(__buf.getvalue()) == __printed:
+            __val = __tail
+        elif __lines:
             __val = __lines[-1].strip()
         else:
             __val = globals().get("answer", globals().get("result"))

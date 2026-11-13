@@ -205,6 +205,15 @@ _NOT_COLUMN = {
     "named", "called", "at", "on", "not", "are", "was", "were", "equals", "equal", "be", "where",
     "whose", "that", "which", "only", "all", "sold", "during", "between", "through", "within",
 }
+# Слова-операторы («first 6», «except 'north'»): перед числом или значением это не имя столбца,
+# поэтому не «нет столбца» (признак невыполнимости), а отказ разбора.
+_OPERATOR_WORDS = {
+    "first", "last", "next", "previous", "prior", "top", "bottom", "except", "excluding", "exclude", "besides",
+    "without", "other", "than", "after", "before", "since", "until", "till", "per", "each", "every", "exclusive",
+    "outside", "not", "but", "only", "half", "twice", "between", "within", "over", "under", "above", "below",
+    "least", "most", "more", "fewer", "less", "remaining", "plus", "minus", "times", "later", "earlier", "past",
+    "following", "preceding", "around", "about", "approximately", "nearly", "almost", "up", "down", "exactly",
+}
 # Слова, которые ничего не меняют в смысле вопроса-агрегата.
 _FILLER = {
     "how", "many", "much", "what", "is", "was", "are", "were", "the", "a", "an", "of", "in", "for",
@@ -273,6 +282,8 @@ def _answer(table: Table, question: str) -> TableAnswer:
     text = re.sub(r"\s+", " ", question or "").strip()
     m = _TAIL_RE.search(text)
     if m:
+        if not _tail_is_service(text[m.start():]):
+            raise _Unparsed(f"в хвосте не только служебные фразы: {text[m.start():][:80]!r}")
         text = text[: m.start()].strip()
 
     # Преамбула «The file X has columns a,b,c (N rows).»: сверяем с файлом и убираем.
@@ -354,6 +365,8 @@ def _answer(table: Table, question: str) -> TableAnswer:
             col = owners[0]
             notes.append(f"column for {val!r} inferred as {col}")
             consume((mm.end() - len(f"qv{i}"), mm.end()))
+        elif col is None and word in _OPERATOR_WORDS:
+            raise _Unparsed(f"слово {word!r} перед {val!r} меняет смысл фильтра")
         elif col is None:
             raise _Missing(f"no column {word!r} (referenced before {val!r}); columns: {table.columns}")
         else:
@@ -397,13 +410,16 @@ def _answer(table: Table, question: str) -> TableAnswer:
             if not mm:
                 break
             word = mm.group(1)
-            if word in _NOT_COLUMN or word in _FILLER:
+            if word in _NOT_COLUMN or word in _FILLER or word in _OPERATOR_WORDS:
                 raise _Unparsed(f"число без столбца: {mm.group(0).strip()!r}")
             col = lookup(word)
             if col is None:
                 raise _Missing(f"no column {word!r} (in {mm.group(0).strip()!r}); columns: {table.columns}")
             if table.types[col] == "str":
                 raise _Unparsed(f"числовой фильтр по строковому столбцу {col}")
+            if op == "==" and (re.search(r"(?:^|\s)from\s*$", s[: mm.start()]) or re.match(r"\s*on(?:\s|$)", s[mm.end():])):
+                # «from month 7» без конца диапазона, «from month 7 on» — это «начиная с», а не «ровно»
+                raise _Unparsed(f"«from/on» у точного значения: {mm.group(0).strip()!r}")
             nums = [float(g) if "." in g else int(g) for g in mm.groups()[1:]]
             if op == "range":
                 lo, hi = nums
@@ -414,6 +430,13 @@ def _answer(table: Table, question: str) -> TableAnswer:
             else:
                 filters.append((col, op, nums[0]))
             consume(mm.span())
+
+    # «in month 10 and month 12»: два разных точных числа одного столбца — это не «оба сразу» (пусто),
+    # а скорее «любой из»; число рядом с диапазоном того же столбца — исключение или уточнение. Отказ.
+    for col in {c for c, op, v in filters if op == "==" and not isinstance(v, str)}:
+        same = [(op, v) for c, op, v in filters if c == col]
+        if len(same) > 1:
+            raise _Unparsed(f"несколько условий на числовой столбец {col}: {same}")
 
     # --- мера
     s = re.sub(r"\s+", " ", s).strip()
@@ -477,9 +500,39 @@ def _answer(table: Table, question: str) -> TableAnswer:
         result = _apply_rounding(result, *rounding)
         plan += f" rounded {rounding[0]}" + (f" to {rounding[1]} places" if rounding[1] else "")
         if rounding[1] > 0:
-            # «rounded to 2 decimal places»: пишем так, как напечатал бы python — print(round(x, 2)) -> 46.0
-            return TableAnswer("ok", answer=repr(round(float(result), rounding[1])), plan=plan, detail="; ".join(notes))
+            # «rounded to 2 decimal places»: пишем так, как напечатал бы python — print(round(x, 2)) -> 46.0.
+            # Если так получается меньше знаков, чем просили (46.0 или 46.00?), формат спорный — отказ.
+            val = round(float(result), rounding[1])
+            if repr(val) != f"{val:.{rounding[1]}f}":
+                raise _Unparsed(f"{val!r} и {val:.{rounding[1]}f}: формат ответа неоднозначен")
+            return TableAnswer("ok", answer=repr(val), plan=plan, detail="; ".join(notes))
+    if isinstance(result, float) and abs(result - round(result, 6)) > 1e-9:
+        # Бесконечная дробь без правила округления (12.333333 или 12.333333333333334?) — формат не задан,
+        # отказ. Шум сложения дробей (0.1 + 0.2) сюда не попадает: он короче шести знаков.
+        raise _Unparsed(f"дробный ответ {result!r} без правила округления")
     return TableAnswer("ok", answer=_fmt_number(result), plan=plan, detail="; ".join(notes))
+
+
+_STD_TAIL_RE = re.compile(r"(?:compute it with|use bash|use the bash|work only inside|when you are done)\b", re.IGNORECASE)
+# Слова служебных фраз про сдачу ответа («Write ONLY the final answer to answer.txt.»).
+_SERVICE_WORDS = {
+    "write", "save", "put", "store", "output", "print", "give", "use", "only", "just", "the", "a", "an", "final",
+    "answer", "result", "number", "value", "integer", "single", "as", "to", "in", "into", "file", "answer.txt",
+    "current", "directory", "python", "python3", "bash", "tool", "tools", "calculate", "compute", "it", "with",
+    "of", "and", "then", "please", "your", "this", "that", "is", "be", "should", "must", "plain", "nothing", "else",
+}
+
+
+def _tail_is_service(tail: str) -> bool:
+    """Отрезанный хвост — только стандартные фразы харнесса или фразы из служебных слов;
+    «Write only the total rounded to tens.» меняет ответ и служебной не считается."""
+    for sent in re.split(r"(?<=[.?!])\s+", tail.strip()):
+        if not sent or _STD_TAIL_RE.match(sent):
+            continue
+        words = re.findall(r"[a-z0-9_.]+", sent.lower().replace("answer.txt", " answer.txt "))
+        if not all(w == "answer.txt" or w.strip(".") in _SERVICE_WORDS for w in words if w.strip(".")):
+            return False
+    return True
 
 
 _ROUND_RE = re.compile(
@@ -580,6 +633,8 @@ def _parse_measure(table: Table, s: str, lookup) -> tuple[str, Optional[str], st
     """Возвращает (агрегат, столбец или None, остаток строки без меры)."""
     def numeric_col(word: str, ctx: str) -> str:
         col = lookup(word)
+        if col is None and (word in _OPERATOR_WORDS or _is_value(table, word)):
+            raise _Unparsed(f"«{ctx}»: {word!r} — не столбец, а уточнение меры")
         if col is None:
             raise _Missing(f"no column {word!r} for measure {ctx!r}; columns: {table.columns}")
         if table.types[col] == "str":
@@ -617,6 +672,9 @@ def _parse_measure(table: Table, s: str, lookup) -> tuple[str, Optional[str], st
         if any(_key(c) in entity_cols for c in table.columns) or Path(table.name).stem.lower() in (word, stem):
             # строки таблицы и есть эти объекты: employees.csv / employee_id -> «how many employees» = число строк
             return ("count", None, s[:mm.start()] + " " + s[mm.end():])
+        if word in _OPERATOR_WORDS or _is_value(table, word):
+            # «How many widget units…»: это значение из таблицы, а не отсутствующий столбец
+            raise _Unparsed(f"не понята мера после «how many {word}»")
         raise _Missing(f"no column {word!r} for 'how many'; columns: {table.columns}")
 
     # «What is the total/average/maximum <col>», «sum of <col>»
@@ -638,6 +696,12 @@ def _parse_measure(table: Table, s: str, lookup) -> tuple[str, Optional[str], st
             raise _Unparsed(f"сумма цены {col} — вероятно, имелась в виду выручка")
         return (agg, col, s[:mm.start()] + " " + s[mm.end():])
     raise _Unparsed(f"не понята мера: {s!r}")
+
+
+def _is_value(table: Table, word: str) -> bool:
+    """Слово — значение строкового столбца («widget», «west»), а не название столбца."""
+    forms = {word, word[:-1] if word.endswith("s") else word}
+    return any(str(r[c]).lower() in forms for c in table.columns if table.types[c] == "str" for r in table.rows[:2000])
 
 
 def _plan_text(agg: str, col: Optional[str], filters: list[tuple[str, str, Any]]) -> str:
@@ -679,5 +743,10 @@ def _missing_confirmed(table: Table, question: str, detail: str) -> bool:
         return False   # условие и файл расходятся — не берёмся судить
     stems = {word, word.rstrip("s"), word[:-2] if word.endswith("es") else word}
     if stems & _COLUMN_SYNONYMS or stems & listed:
+        return False
+    # «orders priced under 20»: слово — форма существующего столбца (price -> priced), а не новый столбец
+    if any(len(c) >= 4 and (word.startswith(c[:5]) or c.startswith(word[:5])) for c in listed if len(word) >= 4):
+        return False
+    if _is_value(table, word):
         return False
     return True

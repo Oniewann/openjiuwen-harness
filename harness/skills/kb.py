@@ -325,6 +325,13 @@ def answer_path_question(kb: KB, question: str) -> PathAnswer:
     if len(questions) != 1:
         return PathAnswer("unparsed", detail="expected exactly one question sentence")
     q = questions[0]
+    if len(re.findall(r"\b(?:who|whom|whose|what|which|where|when)\b", q, re.IGNORECASE)) > 1:
+        # «In which year was X born, and who is the mentor?» — два вопроса в одном: не цепочка
+        return PathAnswer("unparsed", detail="several question words")
+    extra = [s for s in sentences if s != q and not _extra_sentence_ok(s)]
+    if extra:
+        # «Answer with the last two digits only.» меняет ответ: всё, кроме вопроса, должно быть объяснено
+        return PathAnswer("unparsed", detail=f"unexplained sentence {extra[0]!r}")
 
     anchors = find_mentions(kb, q)
     if not anchors:
@@ -395,11 +402,24 @@ def answer_path_question(kb: KB, question: str) -> PathAnswer:
     answer = str(current).strip()
     if answer.lower() in _NO_VALUE or not answer:
         return PathAnswer("broken", chain=chain, anchor=anchor, detail=f"value of {chain[-1]!r} is {answer!r}: no data")
-    if re.search(r"\byear\b", q, re.IGNORECASE) and not re.fullmatch(r"-?\d+", answer):
+    wants_year = re.search(r"\b(?:year|when)\b", q, re.IGNORECASE)
+    if wants_year and not re.fullmatch(r"-?\d+", answer):
         # «In which year…», а в поле полная дата: 1983-04-12, 12.04.1983, April 12, 1983
         years = set(re.findall(r"(?<!\d)(1[5-9]\d\d|20\d\d)(?!\d)", answer))
-        if len(years) == 1:
-            answer = years.pop()
+        if len(years) != 1:
+            return PathAnswer("unparsed", chain=chain, anchor=anchor, detail=f"asked for a year, field is {answer!r}")
+        answer = years.pop()
+    # Тип ответа должен совпадать с вопросом: «Where was X born?» или «Who founded X?» — не про год из поля
+    # Born/Founded (вопросительное слово тогда осталось без объяснения).
+    if not wants_year and re.fullmatch(r"-?\d+", answer) and re.search(
+            r"\b(?:who|whom|where|city|town|place|company|person|name|named)\b", q, re.IGNORECASE):
+        return PathAnswer("unparsed", chain=chain, anchor=anchor, detail=f"asked for a name or place, got {answer!r}")
+    # «Where is X's employer located?»: спрашивают место, а цепочка кончилась на записи (компании) —
+    # слово «located/where» осталось без объяснения. «Where does X work?» — это и есть работодатель.
+    if answer in kb.entries and re.search(r"\b(?:where|city|town|country|place|located|location|based|situated)\b",
+                                          q, re.IGNORECASE) \
+            and not re.match(r"^where (?:does|did|do) \S.* work(?: for| at)?\?$", q, re.IGNORECASE):
+        return PathAnswer("unparsed", chain=chain, anchor=anchor, detail=f"asked for a place, got entry {answer!r}")
     return PathAnswer("ok", answer=answer, chain=chain, anchor=anchor)
 
 
@@ -432,7 +452,28 @@ def _single_question(question: str) -> Optional[str]:
         text = text[len(prefix):].strip()
     sentences = [s.strip() for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
     questions = [s for s in sentences if s.endswith("?")]
-    return questions[0] if len(questions) == 1 else None
+    if len(questions) != 1 or any(s != questions[0] and not _extra_sentence_ok(s) for s in sentences):
+        return None
+    return questions[0]
+
+
+_INTRO_RE = re.compile(r"^the (?:directory|folder) \S+ contains (?:a |an )?(?:small )?knowledge base"
+                       r"(?: of (?:markdown|text|md) files)?\.$", re.IGNORECASE)
+# Слова служебных фраз про сдачу ответа («Write ONLY the answer to answer.txt.»).
+_SERVICE_WORDS = {
+    "write", "save", "put", "store", "output", "print", "give", "use", "only", "just", "the", "a", "an", "final",
+    "answer", "result", "value", "as", "to", "in", "into", "file", "answer.txt", "current", "directory", "bash",
+    "tool", "tools", "it", "with", "and", "then", "please", "your", "this", "that", "is", "be", "should", "must",
+    "plain", "nothing", "else",
+}
+
+
+def _extra_sentence_ok(sentence: str) -> bool:
+    """Предложение рядом с вопросом ничего не меняет: вводная про базу или фраза про сдачу ответа."""
+    if _INTRO_RE.match(sentence.strip()):
+        return True
+    words = re.findall(r"[a-z0-9_.]+", sentence.lower().replace("answer.txt", " answer.txt "))
+    return all(w == "answer.txt" or w.strip(".") in _SERVICE_WORDS for w in words if w.strip("."))
 
 
 def answer_relation_question(kb: KB, question: str) -> PathAnswer:
@@ -452,7 +493,8 @@ def answer_relation_question(kb: KB, question: str) -> PathAnswer:
         names = [m.group(4).strip(), m.group(5).strip()]
         missing = [n for n in names if n not in kb.entries]
         if missing:
-            if unknown_names(kb, missing[0]) or not find_mentions(kb, missing[0]):
+            # «…, Anna Petrov or her mentor?» — не имя, а описание: это не «записи нет», а отказ разбора
+            if unknown_names(kb, missing[0]) and not find_mentions(kb, missing[0]):
                 return PathAnswer("no_anchor", detail=f"no entry named {missing[0]!r}")
             return PathAnswer("unparsed", detail=f"not an exact entry name: {missing[0]!r}")
         if names[0] == names[1]:

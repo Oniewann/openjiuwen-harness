@@ -335,5 +335,66 @@ class QuestionTest(_TmpMixin, unittest.TestCase):
         self.assertStatus("How many units of month 'july' were sold?", "unparsed")
 
 
+
+class ParaphraseRefusalTest(_TmpMixin, unittest.TestCase):
+    """P0-5: слово, меняющее смысл фильтра или формы ответа, — отказ, а не тихий неверный ответ."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = tb.load_table(self.write("sales.csv", SALES))
+
+    def ask(self, question):
+        return tb.answer_table_question(self.t, PREAMBLE + question)
+
+    def test_two_months_with_and(self):
+        # month == 7 и month == 9 одновременно — пусто; имелось в виду «любой из»
+        self.assertEqual(self.ask("How many units of product 'widget' were sold in month 7 and month 9?").status, "unparsed")
+
+    def test_month_with_range(self):
+        q = "How many units of product 'widget' were sold in months 5 through 9 inclusive and month 7?"
+        self.assertEqual(self.ask(q).status, "unparsed")
+
+    def test_operator_word_is_not_missing_column(self):
+        for q in ("How many units of product 'widget' were sold in the first 6 months?",
+                  "How many units were sold except 'north'?", "How many units were sold in the last 3 months?"):
+            self.assertEqual(self.ask(q).status, "unparsed", q)
+
+    def test_answer_format_tail_refused(self):
+        q = "How many units of product 'widget' were sold in months 5 through 9 inclusive? Write only the last digit."
+        self.assertEqual(self.ask(q).status, "unparsed")
+        res = self.ask("How many units of product 'widget' were sold in months 5 through 9 inclusive?" + TAIL)
+        self.assertEqual((res.status, res.answer), ("ok", "125"))
+
+    def test_unrounded_long_fraction_refused(self):
+        # 176 / 7 = 25.142857…: правила округления нет — отказ; округлённое среднее — ответ
+        res = self.ask("What is the average units?")
+        self.assertEqual(res.status, "unparsed")
+        self.assertIn("округления", res.detail)
+        self.assertEqual(self.ask("What is the average units of product 'widget', rounded down to an integer?").answer, "25")
+
+    def test_operator_word_in_measure(self):
+        for q in ("What is the sum of the first 3 units?", "How many each were sold?",
+                  "How many widget units were sold in months 5 through 8 inclusive?",
+                  "What is the units total for widget?", "How many orders had exactly 10 units?"):
+            self.assertEqual(self.ask(q).status, "unparsed", q)
+
+    def test_word_form_of_column_not_confirmed_missing(self):
+        res = self.ask("What is the total units of orders priced under 20?")
+        self.assertNotEqual(res.status, "ok")
+        self.assertFalse(res.confirmed)
+
+    def test_from_month_without_end(self):
+        for q in ("How many units of product 'widget' were sold from month 7 on?",
+                  "How many units of product 'widget' were sold from month 7?"):
+            self.assertEqual(self.ask(q).status, "unparsed", q)
+        self.assertEqual(self.ask("How many units of product 'widget' were sold from month 5 to month 8?").status, "unparsed")
+        self.assertEqual(self.ask("How many units of product 'widget' were sold in months 5 to 8?").answer, "25")
+
+    def test_trailing_zero_format_refused(self):
+        # (17 + 33 + 10 + 12 + 20) / 5 = 18.4 -> 18.4: знаков меньше, чем просили (18.40?) — отказ
+        q = "What is the average price of product 'widget', rounded to 2 decimal places?"
+        self.assertEqual(self.ask(q).status, "unparsed")
+
+
 if __name__ == "__main__":
     unittest.main()

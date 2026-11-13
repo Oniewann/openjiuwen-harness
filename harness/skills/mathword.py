@@ -68,13 +68,18 @@ def answer_math_question(question: str) -> MathAnswer:
     text = re.sub(r"\s+", " ", question or "").strip()
     m = _TAIL_RE.search(text)
     if m:
+        if not _tail_is_service(text[m.start():]):
+            return MathAnswer("unparsed", detail=f"в хвосте не только служебные фразы: {text[m.start():][:80]!r}")
         text = text[: m.start()].strip()
     text = re.sub(r"^(?:solve the following problem[.:]|problem:|task:|question:|word problem:)\s*", "", text,
                   flags=re.IGNORECASE)
     sentences = _split_sentences(text)
     # Служебные фразы после вопроса («Save only the number to answer.txt.») к задаче не относятся.
+    # Строго: фраза целиком из служебных слов. «Report the number doubled.», «Write only the last digit.»
+    # меняют ответ — такую фразу не выбрасываем, и вопрос остаётся неразобранным.
     while len(sentences) > 2 and not sentences[-1].endswith("?") and _SERVICE_RE.search(sentences[-1]) \
-            and not re.search(r"\d", sentences[-1].replace("answer.txt", "")) \
+            and _only_service_words(sentences[-1]) \
+            and not re.search(r"\d", sentences[-1].replace("answer.txt", "").replace("python3", "")) \
             and any(x.endswith("?") or _IMPERATIVE_Q.match(x) for x in sentences[:-1]):
         sentences.pop()
     if len(sentences) < 2:
@@ -88,6 +93,9 @@ def answer_math_question(question: str) -> MathAnswer:
     if not first:
         return MathAnswer("unparsed", detail=f"не понято начало: {sentences[0]!r}")
     subj = first.group(1).lower()
+    if any(w in _NOT_SUBJECT for w in subj.split()):
+        # «A warehouse never starts with…», «The other warehouse starts with…» — слово меняет смысл условия
+        return MathAnswer("unparsed", detail=f"не понято начало: {sentences[0]!r}")
     value = _num(first.group(2))
     item = first.group(3).lower()
     expr = str(value)
@@ -100,7 +108,9 @@ def answer_math_question(question: str) -> MathAnswer:
     END = r"(?: (?:at the end|in the end|now|left|finally|in total|at the end of the period|after (?:all )?(?:this|that)))?"
     PLACE = rf"(?: in (?:the {re.escape(subj)}|it|stock))?"
     q_ok = re.fullmatch(
-        rf"how many {I} (?:(?:does|will|would|did) {S} (?:have|hold|end up with|finish with|own){END}"
+        rf"how many {I} (?:(?:does|will|would) {S} (?:have|hold|end up with|finish with|own){END}"
+        # «did it have?» без «at the end» — в прошлом времени может значить и начало: только с уточнением
+        rf"|did {S} (?:end up with|finish with){END}|did {S} (?:have|hold|own){END[:-1]}"
         rf"|(?:are|remain|are there|will be|will remain|are left|is)(?: left)?{PLACE}{END}"
         rf"|remain{PLACE}{END})\?"
         rf"|what is (?:the|its) final (?:number|count|amount|quantity) of {I}{PLACE}\?"
@@ -122,7 +132,8 @@ def answer_math_question(question: str) -> MathAnswer:
     elif not q_ok:
         qo = re.fullmatch(rf"how many ([a-z]+) (?:does|did) {S} (?:have|own|keep|hold|use)"
                           rf"(?: (?:at the end|in the end|now|left))?\?", q, re.IGNORECASE)
-        if qo and not re.fullmatch(I, qo.group(1), re.IGNORECASE):
+        # «How many items/units does it have?» — общее слово может означать те же коробки: не «другой предмет»
+        if qo and not re.fullmatch(I, qo.group(1), re.IGNORECASE) and qo.group(1).lower() not in _GENERIC_ITEMS:
             other_item = qo.group(1).lower()
         else:
             return MathAnswer("unparsed", steps=steps, detail=f"не понят вопрос: {q!r}")
@@ -192,6 +203,19 @@ def answer_math_question(question: str) -> MathAnswer:
         a = _num(m.group(1))
         return (f"{{e}} + {a}", v + a)
 
+    def own_place(fn):
+        """Причина вида «in the sister warehouse», «from the other warehouse» говорит о другом месте:
+        операция тогда не про наш запас — отказ. «by merging with a sister warehouse» — из примеров."""
+        place = rf"\b(?:{re.escape(subj.split()[-1])}s?|other|sister|another|second|third|new|branch|partner)\b"
+
+        def f(m, v):
+            tail = re.split(rf"\b{re.escape(item)}\b|\bdoubled\b|\btripled\b|\bquadrupled\b", m.group(0), maxsplit=1,
+                            flags=re.IGNORECASE)[-1]
+            if not re.match(r"\s*by merging with", tail, re.IGNORECASE) and re.search(place, tail, re.IGNORECASE):
+                raise _Unparsed(f"операция в другом месте: {m.group(0)!r}")
+            return fn(m, v)
+        return f
+
     rd = r" \(rounded down\)"
     # необязательная причина, не меняющая арифметику: «in a flood», «after a merger»
     CAUSE = (r"(?: (?:in|after|during|due to|because of|from) (?:a|an|the) [a-z]+(?: [a-z]+)?"
@@ -210,12 +234,12 @@ def answer_math_question(question: str) -> MathAnswer:
         ("receive_per_day", r"{S} receives {N} {I} (?:per|each|a) day for {N} days?", add_ab),
         ("receive_n", r"{S} (?:receives|gets|buys|gains) {N} (?:more |new |additional )?{I}", add_a),
         ("receive_delivery_of", r"{S} receives (?:a|one) delivery of {N} {I}", add_a),
-        ("ship_n", r"{S} (?:ships|sells|loses|sends out|gives away|donates) {N} {I}" + CAUSE, sub_a),
+        ("ship_n", r"{S} (?:ships|sells|loses|sends out|gives away|donates) {N} {I}" + CAUSE, own_place(sub_a)),
         ("sell_percent", r"{S} (?:sells|ships|loses|sends out|gives away) {N} ?(?:percent|%) of (?:its|the) (?:{I}|stock|inventory)"
                          r"( \((?:the number (?:sold|shipped|lost|sent out|given away) is )?rounded down\))?", sell_percent),
-        ("double", r"{ST} is doubled" + CAUSE, mul(2)),
-        ("triple", r"{ST} is tripled" + CAUSE, mul(3)),
-        ("quadruple", r"{ST} is quadrupled" + CAUSE, mul(4)),
+        ("double", r"{ST} is doubled" + CAUSE, own_place(mul(2))),
+        ("triple", r"{ST} is tripled" + CAUSE, own_place(mul(3))),
+        ("quadruple", r"{ST} is quadrupled" + CAUSE, own_place(mul(4))),
         ("double_active", r"{S} doubles its (?:stock|inventory)", mul(2)),
         ("triple_active", r"{S} triples its (?:stock|inventory)", mul(3)),
         ("halve_rounded", r"{ST} is halved" + rd, lambda m, v: ("{e} // 2", v // 2)),
@@ -257,6 +281,12 @@ def answer_math_question(question: str) -> MathAnswer:
             if vague != sent and any(rx.fullmatch(vague) for _, rx, _ in compiled):
                 return MathAnswer("infeasible", steps=steps, expression=expr,
                                   detail=f"в условии нет числа: {sent!r}")
+            # «It ships k boxes per day…»: буква-обозначение на месте числа (кроме «a», «A», «I»).
+            # Невыполнима, только если с числом на месте буквы предложение разбирается целиком.
+            letter = re.sub(_LETTER_VAR, "7", sent, count=1)
+            if letter != sent and any(rx.fullmatch(letter) for _, rx, _ in compiled):
+                return MathAnswer("infeasible", steps=steps, expression=expr,
+                                  detail=f"вместо числа буква: {sent!r}")
             return MathAnswer("unparsed", steps=steps, expression=expr, detail=f"не понято предложение: {sent!r}")
 
     if other_item is not None:
@@ -280,7 +310,45 @@ def answer_math_question(question: str) -> MathAnswer:
 
 _SERVICE_RE = re.compile(r"answer\.txt|\bbash\b|\bpython\b|\bcurrent directory\b|\bwrite\b|\bsave\b|\bfile\b|\btool\b"
                          r"|\bcalculate\b|\bcompute\b|\binteger\b|\bnumber\b", re.IGNORECASE)
+# Слова, из которых состоят служебные фразы про сдачу ответа («Save only the number to answer.txt.»).
+_SERVICE_WORDS = {
+    "write", "save", "put", "store", "output", "print", "give", "use", "only", "just", "the", "a", "an", "final",
+    "answer", "result", "number", "value", "integer", "single", "as", "to", "in", "into", "file", "answer.txt",
+    "current", "directory", "python", "python3", "bash", "tool", "tools", "calculate", "compute", "it", "with",
+    "of", "and", "then", "please", "your", "this", "that", "is", "be", "should", "must", "plain", "nothing", "else",
+}
+
+
+def _only_service_words(sentence: str) -> bool:
+    words = re.findall(r"[a-z0-9_.]+", sentence.lower().replace("answer.txt", " answer.txt "))
+    return all(w.strip(".") in _SERVICE_WORDS or w == "answer.txt" for w in words if w.strip("."))
+
+
+_STD_TAIL_RE = re.compile(r"(?:compute it with|use bash|use the bash|work only inside|when you are done)\b", re.IGNORECASE)
+
+
+def _tail_is_service(tail: str) -> bool:
+    """Отрезанный хвост — только стандартные фразы харнесса или фразы из служебных слов («Write only the last
+    digit.» служебной не считается: она меняет ответ)."""
+    for sent in _split_sentences(tail):
+        if not (_STD_TAIL_RE.match(sent) or _only_service_words(sent)):
+            return False
+    return True
+
+
+_GENERIC_ITEMS = {"items", "item", "units", "unit", "things", "goods", "products", "pieces", "packages", "objects",
+                  "parcels", "articles", "stock", "inventory", "ones"}
+# Слова, которые не могут быть частью названия места в первом предложении («A warehouse almost starts…»).
+_NOT_SUBJECT = {
+    "not", "never", "no", "almost", "nearly", "about", "only", "also", "again", "then", "first", "last", "next",
+    "previous", "other", "another", "each", "every", "all", "any", "some", "both", "either", "neither", "none",
+    "if", "unless", "when", "before", "after", "until", "since", "except", "excluding", "besides", "without",
+    "could", "would", "might", "should", "may", "must", "originally", "planned", "expected", "second", "third",
+    "half", "twice", "double", "more", "less", "fewer", "most", "least", "over", "under", "plus", "minus", "times",
+}
+
 _IMPERATIVE_Q = re.compile(r"(?:find|compute|calculate|determine|give|state|report)\b", re.IGNORECASE)
+_LETTER_VAR = r"(?<![\w'’])(?![aAI](?![\w'’]))[A-Za-z](?![\w'’])"
 _VAGUE = r"\b(?:some|several|a few|many|a number of|an unknown number of|a certain number of)\b"
 
 _VERB_OF = {"ship": "ship", "shipped": "ship", "sell": "sell", "sold": "sell",

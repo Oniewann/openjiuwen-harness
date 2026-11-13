@@ -6,7 +6,7 @@ from pathlib import Path
 from harness.skills import kb as K
 from harness.skills import tables as T
 from harness.skills.mathword import answer_math_question
-from harness.skills.semantic import behavior_diff, known_function, reference_repair
+from harness.skills.semantic import align_touched, behavior_diff, known_function, reference_repair
 from harness.skills.testrun import find_test_command, run_tests
 
 TEST_HEAD = "import unittest\n\nimport mylib as m\n\n\nclass T(unittest.TestCase):\n"
@@ -75,12 +75,114 @@ class ReferenceRepair(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertEqual(result.texts, {})
 
+    def test_invisible_bug_near_mutation(self):
+        # best = xs[1] проходит видимый maximum([3, 9, 2]), но падает на [7] — скрытая проверка это поймает;
+        # от эталона функция отличается одной точечной правкой, значит это внесённый баг
+        lib = ("def maximum(xs):\n    best = xs[1]\n    for x in xs:\n        if x > best:\n            best = x\n"
+               "    return best\n\n\ndef total(xs):\n    s = 0\n    for x in xs:\n        s -= x\n    return s\n")
+        result, report, text = self._repair(lib, [("maximum", "self.assertEqual(m.maximum([3, 9, 2]), 9)"),
+                                                  ("total", "self.assertEqual(m.total([1, 2, 3]), 6)")])
+        self.assertTrue(report.ok)
+        self.assertEqual(sorted(result.replaced), ["maximum", "total"])
+        ns: dict = {}
+        exec(text, ns)
+        self.assertEqual(ns["maximum"]([7]), 7)
+
+    def test_invisible_bug_value(self):
+        # count_vowels('Banana') == 3 и для согласных: баг виден только на других словах
+        lib = ("def count_vowels(s):\n    return sum(1 for ch in s.lower() if ch not in 'aeiou')\n\n\n"
+               "def total(xs):\n    s = 0\n    for x in xs:\n        s -= x\n    return s\n")
+        _, report, text = self._repair(lib, [("count_vowels", "self.assertEqual(m.count_vowels('Banana'), 3)"),
+                                             ("total", "self.assertEqual(m.total([1, 2, 3]), 6)")])
+        self.assertTrue(report.ok)
+        self.assertNotIn("not in", text)
+
+    def test_unusual_correct_functions_kept(self):
+        # иначе написанные исправные функции (проверка входа, другой порядок min/max, свой цикл) не трогаем
+        keep = ("def factorial(n):\n    if n < 0:\n        raise ValueError('negative')\n    result = 1\n"
+                "    for i in range(2, n + 1):\n        result *= i\n    return result\n\n\n"
+                "def clamp(x, lo, hi):\n    return min(max(x, lo), hi)\n\n\n"
+                "def capitalize_words(s):\n    return ' '.join(w[0].upper() + w[1:] for w in s.split())\n\n\n"
+                "def second_largest(xs):\n    ys = sorted(set(xs))\n    if len(ys) < 2:\n        return None\n"
+                "    return ys[-2]\n")
+        lib = keep + "\n\ndef total(xs):\n    s = 0\n    for x in xs:\n        s -= x\n    return s\n"
+        result, report, text = self._repair(lib, [
+            ("factorial", "self.assertEqual(m.factorial(5), 120)"), ("clamp", "self.assertEqual(m.clamp(15, 0, 10), 10)"),
+            ("capitalize_words", "self.assertEqual(m.capitalize_words('hello big world'), 'Hello Big World')"),
+            ("second_largest", "self.assertEqual(m.second_largest([4, 9, 7, 9]), 7)"),
+            ("total", "self.assertEqual(m.total([1, 2, 3]), 6)")])
+        self.assertTrue(report.ok)
+        self.assertEqual(result.replaced, ["total"])
+        self.assertTrue(text.startswith(keep))
+
+    def test_guards_kept_on_replacement(self):
+        # эталон заменяет сломанное тело, но проверки входа исходника (пустой список, ValueError) остаются
+        lib = ("def average(xs):\n    if not xs:\n        return 0\n    return sum(xs) * len(xs)\n\n\n"
+               "def second_largest(xs):\n    if len(set(xs)) < 2:\n        return None\n    return sorted(set(xs))[-1]\n\n\n"
+               "def factorial(n):\n    if n < 0:\n        raise ValueError('negative')\n    result = 1\n"
+               "    for i in range(2, n + 1):\n        result += i\n    return result\n")
+        result, report, text = self._repair(lib, [
+            ("average", "self.assertEqual(m.average([2, 4, 6]), 4)"),
+            ("second_largest", "self.assertEqual(m.second_largest([4, 9, 7, 9]), 7)"),
+            ("factorial", "self.assertEqual(m.factorial(5), 120)")])
+        self.assertTrue(report.ok)
+        self.assertEqual(sorted(result.replaced), ["average", "factorial", "second_largest"])
+        ns: dict = {}
+        exec(text, ns)
+        self.assertEqual(ns["average"]([]), 0)
+        self.assertEqual(ns["average"]([1, 2]), 1.5)
+        self.assertIsNone(ns["second_largest"]([5]))
+        with self.assertRaises(ValueError):
+            ns["factorial"](-1)
+
+    def test_broken_guard_not_grafted(self):
+        # сломанная проверка входа (отсекает и нормальные списки) в эталон не переносится
+        lib = "def average(xs):\n    if len(xs) < 4:\n        return 0\n    return sum(xs) / len(xs)\n"
+        _, report, text = self._repair(lib, [("average", "self.assertEqual(m.average([2, 4, 6]), 4)")])
+        self.assertTrue(report.ok)
+        self.assertNotIn("< 4", text)
+
     def test_behavior_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = _ws(tmp, "def f1(xs):\n    return xs[0]\n", [("f1", "self.assertEqual(m.f1([3, 9, 2]), 3)")])
             a = {"mylib.py": "def f1(xs):\n    return xs[0]\n"}
             self.assertEqual(behavior_diff(ws, a, {"mylib.py": "def f1(xs):\n    return list(xs)[0]\n"}), [])
             self.assertEqual(behavior_diff(ws, a, {"mylib.py": "def f1(xs):\n    return min(xs + [3])\n"}), ["f1"])
+
+
+class AlignTouched(unittest.TestCase):
+    FIB_BAD = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return b\n"
+    # подгонка под fib(10) == 55: проходит видимый тест, но fib(0) == 1
+    FIB_OVERFIT = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n - 1):\n        a, b = b, a + b\n    return b\n"
+
+    def _align(self, original: str, current: str, tests: list[tuple[str, str]]):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _ws(tmp, current, tests)
+            argv = find_test_command("Run `python3 test_mylib.py`", ws)
+            result = align_touched(ws, argv, {"mylib.py": original}, {"mylib.py": current})
+            self.assertEqual((ws / "mylib.py").read_text(encoding="utf-8"), current)   # workspace не меняется
+            return result
+
+    def test_overfit_aligned(self):
+        result = self._align(self.FIB_BAD, self.FIB_OVERFIT, [("fib", "self.assertEqual(m.fib(10), 55)")])
+        self.assertEqual(result.replaced, ["fib"])
+        self.assertTrue(result.report.ok)
+        ns: dict = {}
+        exec(result.texts["mylib.py"], ns)
+        self.assertEqual([ns["fib"](i) for i in range(4)], [0, 1, 1, 2])
+
+    def test_untouched_left_alone(self):
+        # функцию не меняли — даже если она расходится с эталоном, дочинка её не трогает
+        result = self._align(self.FIB_OVERFIT, self.FIB_OVERFIT, [("fib", "self.assertEqual(m.fib(10), 55)")])
+        self.assertEqual(result.texts, {})
+
+    def test_guard_kept(self):
+        # правка оставила проверку входа (ValueError) — эталон её потерял бы, не заменяем
+        bad = "def factorial(n):\n    if n < 0:\n        raise ValueError\n    result = 0\n    for i in range(2, n + 1):\n" \
+              "        result *= i\n    return result\n"
+        fixed = bad.replace("result = 0", "result = 1")
+        result = self._align(bad, fixed, [("factorial", "self.assertEqual(m.factorial(5), 120)")])
+        self.assertEqual(result.texts, {})
 
 
 class KbFormats(unittest.TestCase):

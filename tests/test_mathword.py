@@ -227,5 +227,56 @@ class RefusalTest(unittest.TestCase):
         self.assertStatus("", "unparsed")
 
 
+
+class ParaphraseRefusalTest(unittest.TestCase):
+    """P0-5: фраза после вопроса или слово в условии меняет ответ — навык обязан отказаться."""
+
+    def status(self, text):
+        return ask(text).status
+
+    def test_answer_format_sentence_refused(self):
+        base = q("It receives 2 deliveries of 10 boxes each.")
+        for tail in (" Report the number doubled.", " Write only the last digit of the number.",
+                     " Give the answer as a number of dozens, rounded down.", " Answer with the number of hundreds only."):
+            self.assertEqual(self.status(base + tail), "unparsed", tail)
+
+    def test_service_sentence_still_ignored(self):
+        base = q("It receives 2 deliveries of 10 boxes each.")
+        for tail in (" Write ONLY the final answer to the file answer.txt in the current directory.",
+                     " Give the answer as a single integer in answer.txt.",
+                     " Use python to calculate the result. Save only the number to answer.txt."):
+            res = ask(base + tail)
+            self.assertEqual((res.status, res.answer), ("ok", "120"), tail)
+
+    def test_operation_elsewhere_refused(self):
+        for op in ("It ships 30 boxes from the other warehouse.", "It loses 30 boxes in the sister warehouse.",
+                   "Then the stock is doubled in the other warehouse."):
+            self.assertEqual(self.status(q(op)), "unparsed", op)
+        self.assertEqual(ask(q("Then the stock is doubled by merging with a sister warehouse.")).answer, "200")
+        self.assertEqual(ask(q("It loses 30 boxes in a flood.")).answer, "70")
+
+    def test_generic_item_is_not_other_item(self):
+        self.assertEqual(self.status(START + "It ships 5 boxes. How many items does it have at the end?"), "unparsed")
+        self.assertEqual(self.status(START + "It ships 5 boxes. How many trucks does it have?"), "infeasible")
+
+    def test_letter_instead_of_number(self):
+        for op in ("It ships X boxes per day for 3 days.", "It ships 20 boxes per day for k days.",
+                   "It receives N deliveries of 40 boxes each."):
+            self.assertEqual(self.status(q(op)), "infeasible", op)
+        # буква не на месте числа — просто отказ разбора, а не «невыполнима»
+        self.assertEqual(self.status(q("It receives 3 deliveries of 40 boxes each from supplier B.")), "unparsed")
+        self.assertEqual(ask(q("It ships 5 boxes a day for 2 days.")).answer, "90")
+
+    def test_past_tense_needs_time(self):
+        self.assertEqual(self.status(START + "It ships 5 boxes. How many boxes did it have?"), "unparsed")
+        self.assertEqual(ask(START + "It ships 5 boxes. How many boxes did it have at the end?").answer, "95")
+
+    def test_odd_subject_refused(self):
+        self.assertEqual(self.status("A warehouse never starts with 100 boxes. How many boxes does it have at the end?"),
+                         "unparsed")
+        self.assertEqual(self.status("The other warehouse starts with 100 boxes. How many boxes does it have at the end?"),
+                         "unparsed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,10 @@
   * логировать каждый запрос в JSONL (видно, что именно openJiuwen шлёт модели);
   * считать «расход» по формуле регламента: вход/10 + выход (+ рассуждения);
   * эмулировать исчерпание бюджета (--budget): после лимита прокси перестаёт отвечать;
-  * подставлять «мозг» (--brain): echo | script | oracle.
+  * подставлять «мозг» (--brain): echo | script | oracle;
+  * MOCK_ERROR_RATE=0.3 — доля ответов 500 (списываются как вход/10: «запрос ушёл — это входные токены»);
+  * MOCK_MAX_CONCURRENT=2 — при большем числе одновременных запросов отвечать 429
+    «Too many concurrent requests» (не списывается).
 
 Запуск:
     python devtools/mock_llm.py --port 8089 --brain oracle --log /tmp/mock.jsonl
@@ -17,6 +20,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import random
+import os
 import re
 import sys
 import threading
@@ -64,6 +69,12 @@ class State:
         self.exhaust_mode = exhaust_mode
         self.latency = latency
         self.reasoning_tokens = reasoning_tokens
+        self.inflight = 0
+        self.rejected = 0
+        self.errors = 0
+        self.error_rate = float(os.environ.get("MOCK_ERROR_RATE", "0") or 0)
+        self.max_concurrent = int(os.environ.get("MOCK_MAX_CONCURRENT", "0") or 0)
+        self.rng = random.Random(int(os.environ.get("MOCK_SEED", "0") or 0) + 17)
 
     def log(self, record: dict) -> None:
         if not self.log_path:
@@ -138,8 +149,34 @@ def make_handler(state: State):
                 self._send_json(429, {"error": {"message": "token budget exhausted", "type": "budget_exhausted"}})
                 return
 
+            with state.lock:
+                busy = state.max_concurrent and state.inflight >= state.max_concurrent
+                if busy:
+                    state.rejected += 1
+                else:
+                    state.inflight += 1
+            if busy:
+                self._send_json(429, {"error": {"message": f"Too many concurrent requests: "
+                                                           f"{state.max_concurrent} already running"}})
+                return
+            try:
+                self._complete(body)
+            finally:
+                with state.lock:
+                    state.inflight -= 1
+
+        def _complete(self, body: dict) -> None:
             if state.latency:
                 time.sleep(state.latency)
+            if state.error_rate:
+                with state.lock:
+                    fail = state.rng.random() < state.error_rate
+                    if fail:
+                        state.errors += 1
+                        state.spent += messages_tokens(body.get("messages") or [], body.get("tools")) / 10.0
+                if fail:
+                    self._send_json(500, {"error": {"message": "mock internal error"}})
+                    return
 
             messages = body.get("messages") or []
             tools = body.get("tools")

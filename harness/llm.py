@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -36,6 +37,10 @@ class LLMDead(LLMError):
 
 class TaskCapExceeded(LLMError):
     """Задача исчерпала свой потолок токенов."""
+
+
+class BudgetShort(TaskCapExceeded):
+    """До конца бюджета осталось меньше, чем нужно этому вызову, чтобы дать полезный ответ."""
 
 
 @dataclass
@@ -81,6 +86,51 @@ class _RateLimiter:
             await asyncio.sleep(delay)
 
 
+class _AdaptiveGate:
+    """Ограничение числа одновременных запросов, которое сужается после 429 «слишком много
+    одновременных запросов» и медленно возвращается после серии успехов."""
+
+    def __init__(self, limit: int):
+        self.max = max(1, limit)
+        self.limit = self.max
+        self.inflight = 0
+        self.ok_streak = 0
+        self._cond: Optional[asyncio.Condition] = None
+
+    def _c(self) -> asyncio.Condition:
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def __aenter__(self):
+        cond = self._c()
+        async with cond:
+            while self.inflight >= self.limit:
+                await cond.wait()
+            self.inflight += 1
+        return self
+
+    async def __aexit__(self, *exc_info):
+        cond = self._c()
+        async with cond:
+            self.inflight -= 1
+            cond.notify_all()
+        return False
+
+    def shrink(self) -> None:
+        self.limit = max(1, self.limit - 1)
+        self.ok_streak = 0
+
+    def success(self) -> None:
+        self.ok_streak += 1
+        if self.ok_streak >= 20 and self.limit < self.max:
+            self.limit += 1
+            self.ok_streak = 0
+
+
+_EXHAUSTED_WORDS = ("budget", "exhaust", "quota", "insufficient", "balance", "credit", "бюджет", "исчерпан")
+
+
 def _status_code(exc: BaseException) -> Optional[int]:
     """Код HTTP из цепочки исключений (openJiuwen оборачивает ошибку SDK в свою)."""
     cur: Optional[BaseException] = exc
@@ -98,9 +148,13 @@ def _status_code(exc: BaseException) -> Optional[int]:
 
 
 def classify_error(exc: BaseException) -> str:
-    """auth | model | endpoint | bad_request | transient"""
+    """auth | model | endpoint | bad_request | rate | exhausted | transient"""
     code = _status_code(exc)
     text = str(exc).lower()
+    if code == 429 or "too many" in text or "слишком много" in text:
+        # 429 бывает двух видов: «подожди» (лимит одновременных запросов или частоты)
+        # и «бюджет исчерпан» (так отвечает заглушка; настоящий прокси может так же).
+        return "exhausted" if any(w in text for w in _EXHAUSTED_WORDS) else "rate"
     if code in (401, 403):
         return "auth"
     if code == 404:
@@ -131,7 +185,7 @@ class LLMHub:
         self._first_failure_at: Optional[float] = None
         self._breaker_until = 0.0
         self._auth_failures = 0
-        self._sem: Optional[asyncio.Semaphore] = None
+        self._gate = _AdaptiveGate(cfg.max_parallel)
         self._rate = _RateLimiter(cfg.rpm_limit)
         self._model = None
         self._base_url = cfg.base_url
@@ -175,10 +229,20 @@ class LLMHub:
 
         return await Model.invoke(self.model(), messages, **kwargs)
 
-    def _semaphore(self) -> asyncio.Semaphore:
-        if self._sem is None:
-            self._sem = asyncio.Semaphore(self.cfg.max_parallel)
-        return self._sem
+    def _min_useful_tokens(self, model_name: str, max_tokens: int) -> int:
+        """Меньше этого max_tokens вызов почти наверняка бесполезен (модель с рассуждениями
+        тратит всё на рассуждения и возвращает пустой ответ; код обрывается)."""
+        if not model_name.endswith("-noreason"):
+            return 1500
+        if max_tokens >= self.cfg.max_tokens_code:
+            return 300
+        return 60
+
+    def _prompt_estimate(self, messages) -> int:
+        items = messages if isinstance(messages, list) else [{"content": str(messages)}]
+        texts = [_content_text(m.get("content") if isinstance(m, dict) else getattr(m, "content", ""))
+                 for m in items]
+        return int((sum(approx_tokens(t) + 4 for t in texts) + 3) * max(1.0, self.token_ratio))
 
     # ------------------------------------------------------------------ область учёта
     @contextlib.contextmanager
@@ -227,16 +291,16 @@ class LLMHub:
         if scope.get("model"):
             kwargs["model"] = scope["model"]
 
+        wanted_tokens = int(kwargs.get("max_tokens") or self.cfg.max_tokens_code)
+        prompt_est = self._prompt_estimate(messages)
         attempt = 0
+        rate_waits = 0
+        budget_waits = 0
         while True:
             if self.dead:
                 raise LLMDead(self.dead_reason or "proxy is not responding")
             if cap is not None and self.ledger.task_spent(task_id) >= cap:
                 raise TaskCapExceeded(f"task {task_id} reached its token cap {cap:.0f}")
-            remaining = self.ledger.remaining()
-            if remaining is not None and remaining <= 0:
-                self.dead, self.dead_reason = True, "known token budget is exhausted"
-                raise LLMDead(self.dead_reason)
 
             wait = self._breaker_until - time.monotonic()
             if wait > 0:
@@ -245,42 +309,84 @@ class LLMHub:
 
             model_name = self.resolve_model(kwargs.get("model"))
             kwargs["model"] = model_name
-            attempt += 1
-            await self._rate.wait()
-            async with self._semaphore():
-                started = time.monotonic()
-                try:
-                    message = await self._raw_invoke(messages, kwargs)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 — любая ошибка SDK или сети
-                    kind = classify_error(exc)
-                    self._record_failure(scope, model_name, time.monotonic() - started, kind, exc)
-                    if kind == "model":
-                        self.unavailable_models.add(model_name)
-                        if self.cfg.single_model or len(self.unavailable_models) >= len(ALLOWED_MODELS):
-                            raise LLMError(f"model {model_name} is not available: {exc}") from exc
-                        attempt -= 1
-                        continue  # сразу пробуем замену
-                    if kind == "endpoint" and not self._alt_base_tried:
-                        self._switch_base_url()
-                        attempt -= 1
+            # Бюджет: худший случай вызова (max_tokens + вход/10) резервируется до ответа, чтобы
+            # одновременные запросы не прошли проверку по одному и тому же остатку.
+            reservation = 0.0
+            limit = self.ledger.hard_limit()
+            if limit is not None:
+                if self.ledger.spent >= limit:
+                    self.dead, self.dead_reason = True, "known token budget is exhausted"
+                    raise LLMDead(self.dead_reason)
+                avail = limit - self.ledger.spent - self.ledger.reserved - prompt_est / 10.0
+                need = self._min_useful_tokens(model_name, wanted_tokens)
+                if avail < min(need, wanted_tokens):
+                    if self.ledger.has_reservations() and budget_waits < 600:
+                        budget_waits += 1
+                        await asyncio.sleep(0.3)   # запущенные вызовы вернут часть резерва
                         continue
-                    if kind == "bad_request":
-                        raise LLMError(f"bad request: {exc}") from exc
-                    if kind == "auth":
-                        self._auth_failures += 1
-                        if self._auth_failures >= 3:
-                            self.dead, self.dead_reason = True, f"access denied by proxy: {str(exc)[:200]}"
-                            raise LLMDead(self.dead_reason) from exc
-                    self._on_transient_failure()
-                    if attempt >= 3:
-                        raise LLMError(f"model call failed after {attempt} attempts: {str(exc)[:300]}") from exc
-                    pause = min(2.0 * (3 ** (attempt - 1)), 20.0)
-                else:
-                    self._on_success()
-                    record = self._record_success(scope, model_name, messages, message, time.monotonic() - started)
-                    return message, record
+                    raise BudgetShort(f"only ~{max(avail, 0):.0f} tokens left in the budget; "
+                                      f"this call needs at least {min(need, wanted_tokens)}")
+                kwargs["max_tokens"] = int(min(wanted_tokens, avail))
+                reservation = kwargs["max_tokens"] + prompt_est / 10.0
+                self.ledger.reserve(reservation)
+            attempt += 1
+            try:
+                await self._rate.wait()
+                async with self._gate:
+                    started = time.monotonic()
+                    try:
+                        message = await self._raw_invoke(messages, kwargs)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 — любая ошибка SDK или сети
+                        failure = exc
+                        failed_after = time.monotonic() - started
+                    else:
+                        failure = None
+            finally:
+                if reservation:
+                    self.ledger.release(reservation)
+            if failure is None:
+                self._on_success()
+                record = self._record_success(scope, model_name, messages, message, time.monotonic() - started)
+                limit = self.ledger.hard_limit()
+                if limit is not None and self.ledger.spent >= limit:
+                    self.dead, self.dead_reason = True, "known token budget is exhausted"
+                return message, record
+            exc = failure
+            kind = classify_error(exc)
+            self._record_failure(scope, model_name, failed_after, kind, exc, prompt_est)
+            if kind == "exhausted":
+                self.dead, self.dead_reason = True, f"proxy reports the budget is exhausted: {str(exc)[:200]}"
+                raise LLMDead(self.dead_reason) from exc
+            if kind == "rate" and rate_waits < 40:
+                # «Подожди»: не сбой и не попытка. Сужаем параллельность и повторяем.
+                rate_waits += 1
+                attempt -= 1
+                self._gate.shrink()
+                await asyncio.sleep(1.0 + random.random())
+                continue
+            if kind == "model":
+                self.unavailable_models.add(model_name)
+                if self.cfg.single_model or len(self.unavailable_models) >= len(ALLOWED_MODELS):
+                    raise LLMError(f"model {model_name} is not available: {exc}") from exc
+                attempt -= 1
+                continue  # сразу пробуем замену
+            if kind == "endpoint" and not self._alt_base_tried:
+                self._switch_base_url()
+                attempt -= 1
+                continue
+            if kind == "bad_request":
+                raise LLMError(f"bad request: {exc}") from exc
+            if kind == "auth":
+                self._auth_failures += 1
+                if self._auth_failures >= 3:
+                    self.dead, self.dead_reason = True, f"access denied by proxy: {str(exc)[:200]}"
+                    raise LLMDead(self.dead_reason) from exc
+            self._on_transient_failure()
+            if attempt >= 3:
+                raise LLMError(f"model call failed after {attempt} attempts: {str(exc)[:300]}") from exc
+            pause = min(2.0 * (3 ** (attempt - 1)), 20.0)
             await asyncio.sleep(pause)
 
     def _switch_base_url(self) -> None:
@@ -291,6 +397,7 @@ class LLMHub:
         self._model = None
 
     def _on_success(self) -> None:
+        self._gate.success()
         self._consecutive_failures = 0
         self._first_failure_at = None
         self._auth_failures = 0
@@ -346,10 +453,15 @@ class LLMHub:
                 pass
         return record
 
-    def _record_failure(self, scope: dict, model_name: str, seconds: float, kind: str, exc: BaseException) -> None:
-        self.ledger.calls.append(CallRecord(
+    def _record_failure(self, scope: dict, model_name: str, seconds: float, kind: str, exc: BaseException,
+                        prompt_est: int = 0) -> None:
+        # Организаторы: «если запрос ушёл — это уже входные токены», даже если он завершился ошибкой.
+        # Списываем вход по оценке, чтобы учёт не был ниже учёта жюри.
+        prompt_tokens = 0 if kind in ("endpoint", "auth") else prompt_est
+        self.ledger.add(CallRecord(
             task_id=scope.get("task_id", "-"), family=scope.get("family", "-"), step=scope.get("step", "-"),
-            model=model_name, prompt_tokens=0, completion_tokens=0, reasoning_tokens=0, cost=0.0,
+            model=model_name, prompt_tokens=prompt_tokens, completion_tokens=0, reasoning_tokens=0,
+            cost=self.ledger.cost(prompt_tokens, 0, 0),
             seconds=round(seconds, 3), ok=False, error=f"{kind}: {str(exc)[:200]}",
         ))
 

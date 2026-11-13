@@ -215,8 +215,35 @@ class SearchSolver(ExprSolver):
             score = sum(1 for t in terms if t in low) + (5 if title in self.anchors else 0)
             scored.append((score, title, text))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        chunks, used = [], 0
-        for score, _title, text in scored:
+        # Маленькую базу отдаём целиком: вопрос может идти по цепочке (человек -> компания -> город),
+        # а файл компании слов вопроса не содержит.
+        if approx_tokens("".join(self.kb.texts.values())) <= budget_tokens:
+            return "\n---\n".join(text.strip() for _s, _t, text in scored)
+        # Большая база: сначала записи из вопроса и те, на которые они ссылаются (два перехода), затем похожие.
+        from ..skills.kb import find_mentions
+
+        chain: list[str] = [t for t in self.anchors if t in self.kb.texts]
+        frontier = list(chain)
+        for _hop in range(2):
+            nxt = []
+            for title in frontier:
+                for linked in find_mentions(self.kb, self.kb.texts[title]):
+                    if linked not in chain and linked in self.kb.texts:
+                        chain.append(linked)
+                        nxt.append(linked)
+            frontier = nxt[:12]
+        chunks, used, taken = [], 0, set()
+        for title in chain[:40]:
+            text = self.kb.texts[title]
+            cost = approx_tokens(text)
+            if used + cost > budget_tokens and chunks:
+                break
+            chunks.append(text.strip())
+            taken.add(title)
+            used += cost
+        for score, title, text in scored:
+            if title in taken:
+                continue
             if score <= 0 and chunks:
                 break
             cost = approx_tokens(text)

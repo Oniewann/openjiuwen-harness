@@ -34,6 +34,7 @@ from .solvers.families import solver_class
 from .tasks import Task
 
 EXPENSIVE_STEPS = ("strong", "react")
+WAIT = "wait for running calls"
 
 
 @dataclass
@@ -63,6 +64,7 @@ class Scheduler:
         self.stop_reason = ""
         self._cond: Optional[asyncio.Condition] = None
         self.on_progress: Optional[Callable[[], None]] = None
+        self.tight = False                 # бюджет мал для числа задач: работать фазами
 
     # ------------------------------------------------------------------ вспомогательное
     def elapsed(self) -> float:
@@ -135,14 +137,24 @@ class Scheduler:
         if self.ledger.task_spent(solver.task.task_id) + est.cost > self.cfg.task_token_cap:
             return "per-task token cap"
         # Бюджет из BUDGET, а если его не передали — ориентир организаторов (100 000).
-        budget = self.ledger.budget or self.cfg.assumed_budget
-        remaining = budget - self.ledger.spent - self.ledger.reserved
-        if self.estimator.safe_cost(est.cost) > remaining - budget * self.cfg.budget_reserve:
+        budget = self.cfg.effective_budget()
+        remaining = budget - self.ledger.spent
+        need = self.estimator.safe_cost(est.cost)
+        if need > remaining - budget * self.cfg.budget_reserve:
             return "does not fit into the remaining budget"
+        if self.ledger.has_reservations() and need > remaining - self.ledger.reserved - budget * self.cfg.budget_reserve:
+            return WAIT   # не влезает только из-за резерва запущенных вызовов: подождать их
+        # Дорогие ступени — только при большом запасе: при тесном бюджете их токены нужнее
+        # первым попыткам других задач.
+        if step == "strong" and remaining < 5 * max(est.cost, 1500.0):
+            return "too little budget left for a reasoning model"
+        if step == "react" and remaining < 10 * self.cfg.react_token_cap:
+            return "too little budget left for the agent"
         return ""
 
     def _pick(self) -> Optional[Pick]:
         best: Optional[Pick] = None
+        best_key: tuple = ()
         for solver in self.solvers:
             task_id = solver.task.task_id
             if task_id in self.running or task_id in self.closed:
@@ -160,6 +172,8 @@ class Scheduler:
                 solver.note("estimate_error", error=str(exc)[:200])
                 est = StepEstimate(cost=200.0, p_success=0.5)
             refusal = self._gate(solver, step, est)
+            if refusal == WAIT:
+                continue
             if refusal:
                 self._say(solver, f"skip {step}: {refusal}")
                 if refusal == "statically infeasible" and solver.status == "pending" and solver.best is None:
@@ -169,8 +183,12 @@ class Scheduler:
             density = est.p_success * solver.task.reward / max(est.cost, 1.0)
             # задачи, где вызовы уже срывались, чуть отодвигаем, чтобы не крутиться на одной
             density /= 1 + solver.infra_errors
-            if best is None or density > best.density:
-                best = Pick(solver, step, est, density)
+            # При тесном бюджете — фазами: сначала по одной платной попытке каждой задаче,
+            # потом перепроверки и эскалации.
+            first = 1 if self.tight and not any(s != "skill" for s in solver.done) else 0
+            key = (first, density)
+            if best is None or key > best_key:
+                best, best_key = Pick(solver, step, est, density), key
         return best
 
     # ------------------------------------------------------------------ выполнение
@@ -242,6 +260,8 @@ class Scheduler:
         self._cond = asyncio.Condition()
         await self._prepare_all()
         free = sum(1 for s in self.solvers if s.status == "verified")
+        open_tasks = sum(1 for s in self.solvers if s.status == "pending")
+        self.tight = self.cfg.effective_budget() < 100.0 * open_tasks
         self.log(f"[{self.elapsed():7.1f}s] prepared {len(self.solvers)} tasks; solved without the model: {free}; "
                  f"flagged infeasible: {sum(1 for s in self.solvers if s.status == 'infeasible')}")
         if not self.cfg.base_url:

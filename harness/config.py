@@ -39,6 +39,31 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_BUDGET_SUFFIX = {"k": 1e3, "m": 1e6}
+
+
+def parse_budget(raw: Optional[str]) -> Optional[float]:
+    """Число из BUDGET в любой разумной записи: 100000, 1e5, 100_000, "100 000", 100k, 1.5M.
+
+    None — если строку разобрать не удалось (вызывающий решает, что делать).
+    """
+    if raw is None:
+        return None
+    text = raw.strip().strip("\"'").lower().replace("_", "").replace(" ", "").replace(",", "")
+    text = text.replace("tokens", "").replace("token", "")
+    mult = 1.0
+    if text and text[-1] in _BUDGET_SUFFIX:
+        mult = _BUDGET_SUFFIX[text[-1]]
+        text = text[:-1]
+    try:
+        value = float(text) * mult
+    except ValueError:
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, value)
+
+
 def _env_float(name: str, default: Optional[float]) -> Optional[float]:
     value = _env(name)
     if value is None:
@@ -78,11 +103,15 @@ class Config:
     enable_react: bool = True                   # запасной ReAct-агент openJiuwen
 
     # --- лимиты ---
-    max_parallel: int = 5                       # регламент: до 5 сессий одновременно
+    # Регламент: «до 5 сессий», но ключ разработки отвечает 429 уже на четвёртый одновременный запрос.
+    # 429 «слишком много запросов» не считается сбоем: ждём и снижаем число одновременных запросов.
+    max_parallel: int = 3
     time_limit_s: float = 55 * 60               # жёсткий предел прогона 1 час; останавливаемся раньше
     rpm_limit: int = 55                         # запросов в минуту (у тарифа разработки лимит 60)
     budget: Optional[float] = None              # бюджет в выходных токенах из переменной BUDGET
+    budget_raw: Optional[str] = None            # строка BUDGET как пришла (для лога)
     assumed_budget: float = 100_000.0           # ориентир организаторов, если BUDGET не передали
+    unparsed_budget: float = 20_000.0           # BUDGET задан, но не разобран: осторожная оценка
     budget_reserve: float = 0.03                # доля бюджета, которую не трогаем
     answer_in_workspace: bool = False           # дублировать answer.txt в workspace/ (организаторы: «рядом» с task.json)
     # Платная эскалация запускается, только если оценка шанса на успех не ниже порога.
@@ -110,10 +139,26 @@ class Config:
 
     # --- отладка ---
     trace_dir: Optional[str] = None             # куда писать траектории (по умолчанию /tmp)
-    trace_text: bool = False                    # сохранять тексты запросов и ответов (только локально)
+    trace_text: bool = False                    # сохранять тексты ответов модели (только локально)
     verbose: bool = False
 
     extra: dict = field(default_factory=dict)
+
+    def effective_budget(self) -> float:
+        return self.budget if self.budget is not None else self.assumed_budget
+
+    def scale_to(self, n_tasks: int, total_reward: float) -> None:
+        """Лимиты в абсолютных токенах подобраны под 100 000 на ~100 задач; при другом бюджете —
+        в долях: на задачу не больше четырёх её «долей», курс токенов за балл — не больше
+        двух средних, но не ниже 500 (иначе при тесном бюджете курс запрещает даже первые
+        попытки; дорогие ступени отсекает отдельная проверка остатка в планировщике).
+        При 100 000 и 100 задачах всё остаётся почти как было."""
+        budget = self.effective_budget()
+        share = budget / max(1, n_tasks)
+        self.task_token_cap = min(self.task_token_cap, max(150.0, 4.0 * share))
+        self.react_token_cap = min(self.react_token_cap, self.task_token_cap)
+        if total_reward > 0:
+            self.tokens_per_point = min(self.tokens_per_point, max(500.0, 2.0 * budget / total_reward))
 
     def model_for(self, role: str) -> str:
         """Имя модели для роли с учётом режима одной модели."""
@@ -142,11 +187,15 @@ def load_config() -> Config:
     cfg.time_limit_s = float(_env_float("HARNESS_TIME_LIMIT", cfg.time_limit_s) or cfg.time_limit_s)
     cfg.rpm_limit = _env_int("HARNESS_RPM", cfg.rpm_limit)
     # Организаторы: «Бюджет будет передан в переменной окружения BUDGET — например BUDGET=100000».
+    # 13.11: «бюджет может отличаться от 100k» — принимаем любую величину и запись.
     for name in ("BUDGET", "HARNESS_TOKEN_BUDGET", "TOKEN_BUDGET", "LLM_TOKEN_BUDGET", "BUDGET_TOKENS"):
-        value = _env_float(name, None)
-        if value and value > 0:
-            cfg.budget = value
-            break
+        raw = _env(name)
+        if raw is None:
+            continue
+        cfg.budget_raw = raw
+        value = parse_budget(raw)
+        cfg.budget = value if value is not None else cfg.unparsed_budget
+        break
     cfg.min_p_escalate = float(_env_float("HARNESS_MIN_P_ESCALATE", cfg.min_p_escalate) or 0.0)
     cfg.tokens_per_point = float(_env_float("HARNESS_TOKENS_PER_POINT", cfg.tokens_per_point) or cfg.tokens_per_point)
     cfg.task_token_cap = float(_env_float("HARNESS_TASK_CAP", cfg.task_token_cap) or cfg.task_token_cap)

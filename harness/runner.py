@@ -97,9 +97,15 @@ async def run(tasks_dir: str, cfg: Optional[Config] = None, scratch: Optional[Pa
     for task in tasks:
         by_type[task.task_type] = by_type.get(task.task_type, 0) + 1
     _log(f"[harness] tasks: {len(tasks)} {by_type}; total reward {sum(t.reward for t in tasks):g}")
+    cfg.scale_to(len(tasks), sum(t.reward for t in tasks))
+    _log(f"[harness] budget={cfg.budget if cfg.budget is not None else 'not set'} (BUDGET={cfg.budget_raw!r}); "
+         f"effective={cfg.effective_budget():.0f}; task cap={cfg.task_token_cap:.0f}; "
+         f"tokens per point={cfg.tokens_per_point:.0f}")
+    if cfg.budget_raw is not None and cfg.budget == cfg.unparsed_budget:
+        _log(f"[harness] WARNING: cannot parse BUDGET={cfg.budget_raw!r}; assuming a cautious {cfg.unparsed_budget:.0f}")
     _log(f"[harness] models: fast={cfg.model_for('fast')} alt={cfg.model_for('fast_alt')} "
          f"strong={cfg.model_for('strong')}; fastpath={cfg.fastpath} crosscheck={cfg.crosscheck} "
-         f"verify={cfg.verify}; parallel={cfg.max_parallel}; budget={cfg.budget or 'unknown'}; "
+         f"verify={cfg.verify}; parallel={cfg.max_parallel}; budget={cfg.effective_budget():.0f}; "
          f"proxy={'set' if cfg.base_url else 'NOT SET'}")
     if not tasks:
         _log(f"[harness] no tasks found in {tasks_dir}")
@@ -154,5 +160,8 @@ async def run(tasks_dir: str, cfg: Optional[Config] = None, scratch: Optional[Pa
          f"{summary['by_status']}; spent {summary['spent']:.0f} output-equivalent tokens "
          f"in {report['ledger']['calls']} calls"
          + (f"; stopped: {summary['stop_reason']}" if summary.get("stop_reason") else ""))
+    led = report["ledger"]
+    _log(f"[harness] budget: spent {led['spent']:.0f} of {cfg.effective_budget():.0f}; "
+         f"calls {led['calls']}, failed {led.get('failed_calls', 0)}")
     _log(f"[harness] report: {report_path}")
     return report

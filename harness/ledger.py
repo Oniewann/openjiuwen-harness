@@ -46,6 +46,26 @@ class Ledger:
         self.spent: float = 0.0
         self.by_task: dict[str, float] = {}
         self.reserved: float = 0.0  # оценка расхода уже запущенных, но не завершённых вызовов
+        self._open = 0              # сколько резервов открыто
+
+    def hard_limit(self) -> Optional[float]:
+        """Сколько можно потратить всего: бюджет без маленького запаса на неточность учёта."""
+        if self.budget is None:
+            return None
+        return self.budget - max(3.0, 0.01 * self.budget)
+
+    def reserve(self, amount: float) -> None:
+        self.reserved += amount
+        self._open += 1
+
+    def release(self, amount: float) -> None:
+        self._open = max(0, self._open - 1)
+        # Без открытых резервов обнуляем: иначе от сложений с плавающей точкой остаётся хвост
+        # вроде 1e-13, и проверка «есть ли запущенные вызовы» навсегда отвечает «да».
+        self.reserved = 0.0 if self._open == 0 else max(0.0, self.reserved - amount)
+
+    def has_reservations(self) -> bool:
+        return self._open > 0
 
     def add(self, record: CallRecord) -> None:
         self.calls.append(record)
@@ -75,6 +95,7 @@ class Ledger:
         return {
             "spent": round(self.spent, 1),
             "calls": len(self.calls),
+            "failed_calls": sum(1 for c in self.calls if not c.ok),
             "prompt_tokens": sum(c.prompt_tokens for c in self.calls),
             "completion_tokens": sum(c.completion_tokens for c in self.calls),
             "reasoning_tokens": sum(c.reasoning_tokens for c in self.calls),

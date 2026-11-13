@@ -117,9 +117,81 @@ def normalize_answer(raw: str) -> str:
             text = text[1:-1].strip()
         if text == before:
             break
-    if re.fullmatch(r"-?\d+\.0+", text):
-        text = text.split(".")[0]
-    return text
+    return canonical_number(text)
+
+
+_PLAIN_NUM_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+
+
+def canonical_number(text: str) -> str:
+    """Число в записи без контекста вопроса — так, как его напечатал бы print():
+    «.5» -> «0.5», «+5» -> «5», «12.» и «12.0» -> «12», «-0» -> «0».
+
+    Целое с нулями после точки («46.00») тоже становится целым: так модель и наивный агент пишут
+    целые суммы. Нули после значащих цифр («0.50») не трогаем — без вопроса не видно, просили ли
+    ровно два знака (это решает fit_number_to_question)."""
+    if not _PLAIN_NUM_RE.fullmatch(text or ""):
+        return text
+    sign = "-" if text.startswith("-") else ""
+    whole, _, frac = text.lstrip("+-").partition(".")
+    whole = whole or "0"
+    if frac.strip("0") == "":
+        frac = ""
+    if not frac and whole.strip("0") == "":
+        sign = ""
+    return sign + whole + ("." + frac if frac else "")
+
+
+_PLACES_RE = re.compile(r"\b(?:to|with)\s+(\d+|one|two|three|four|five|six)\s+decimal\s+(?:places?|digits?)\b",
+                        re.IGNORECASE)
+_PLACES_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+# Вопрос сам говорит о виде числа — нули в дробной части не трогаем.
+_FORMAT_WORDS_RE = re.compile(r"round|decimal|cent|digit|place|precision|significant|format|percent|%|fraction",
+                              re.IGNORECASE)
+# Ответ — счёт или год: «rounded to 2 decimal places» в таком вопросе относится к порогу, не к ответу.
+_COUNT_Q_RE = re.compile(r"\s*(?:how many|in (?:which|what) year|what year|how old)\b|.*\bhow many decimal",
+                         re.IGNORECASE | re.DOTALL)
+# Счёт где угодно в вопросе («Count the rows…», «What is the number of…», «… How many…»): целое значение
+# дополнять нулями нельзя, знаки после точки относятся к порогу или к данным.
+_COUNT_ANY_RE = re.compile(r"\b(?:how many|number of|count)\b", re.IGNORECASE)
+_SCI_NUM_RE = re.compile(r"-?(\d+)(?:\.(\d+))?(?:[eE][+-]?\d+)?")
+
+
+def fit_number_to_question(value: str, question: str, computed: bool = True) -> str:
+    """Числовой ответ в том виде, в каком его, вероятнее всего, записал автор задачи.
+
+    «rounded to N decimal places» — ровно N знаков после точки: 46 -> 46.00, 23.4 -> 23.40,
+    23.456 -> 23.46 (модель забыла округлить). Без указаний о виде числа — как print():
+    0.50 -> 0.5; целые остаются целыми (12.0 -> 12, как в эталонах exact_int). Нечисловые ответы
+    и всё спорное возвращаются как есть.
+
+    computed=False — значение переписано из данных (search): эталон — запись из базы как есть,
+    print-вид к нему не применяется."""
+    m = _SCI_NUM_RE.fullmatch(value or "")
+    if not m:
+        return value
+    places = {int(n) if n.isdigit() else _PLACES_WORDS[n.lower()] for n in _PLACES_RE.findall(question or "")}
+    if places:
+        if len(places) != 1 or _COUNT_Q_RE.match(question):
+            return value
+        if not m.group(2) and "e" not in value.lower() and _COUNT_ANY_RE.search(question):
+            return value    # целый счёт: «Count the rows where price, rounded to 2 decimal places, …» -> 7
+        n = places.pop()
+        if not 1 <= n <= 10:
+            return value
+        frac = m.group(2) or ""
+        if "e" not in value.lower() and len(frac) <= n:
+            out = value.split(".")[0] + "." + frac.ljust(n, "0")
+        else:
+            out = f"{round(float(value), n):.{n}f}"
+        return out.lstrip("-") if float(out) == 0 else out
+    if not computed or _FORMAT_WORDS_RE.search(question or "") or "e" in value.lower():
+        return value
+    if m.group(2) and value.endswith("0"):
+        value = canonical_number(value.rstrip("0"))
+    # 0.00001 оставляем как есть, хотя print() дал бы 1e-05: так же пишет навык таблиц (голоса
+    # должны совпадать), а «1e-05» на «how much» считается странным ответом и зовёт перепроверку.
+    return value
 
 
 def looks_integer(text: str) -> bool:

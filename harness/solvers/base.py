@@ -26,7 +26,8 @@ from ..estimator import Estimator, Evidence
 from ..llm import LLMDead, LLMError, LLMHub, Reply, TaskCapExceeded
 from ..pot import PotResult, looks_like_code, run_pot
 from ..tasks import Task
-from ..textutil import approx_tokens, extract_code, is_refusal, looks_integer, normalize_answer
+from ..textutil import (approx_tokens, extract_code, fit_number_to_question, is_refusal, looks_integer,
+                        normalize_answer)
 
 # Вес источника при голосовании.
 VOTE_WEIGHT = {"skill": 1.5, "fast": 1.0, "fast_alt": 1.0, "strong": 2.0, "react": 1.5}
@@ -300,7 +301,8 @@ class ExprSolver(Solver):
         if re.search(r"\b(?:how many years|how much) (?:older|younger)\b|\bage (?:difference|gap)\b|\byears apart\b", ql) \
                 and re.fullmatch(r"-\d+(?:\.\d+)?", v):
             v = v[1:]   # «на сколько лет старше» — величина, знак зависит только от порядка вычитания
-        return v, ""
+        # вид числа: ровно N знаков для «rounded to N decimal places», иначе как print()
+        return fit_number_to_question(v, q, computed=getattr(self, "family", "") != "search"), ""
 
     async def _ask(self, step: str, messages: list[dict], temperature: float = 0.0) -> Reply:
         role = ROLE_OF_STEP.get(step, "fast")

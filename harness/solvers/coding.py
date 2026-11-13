@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import shlex
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -34,6 +36,47 @@ CODING_SYSTEM = (
     "If the tests contradict each other or cannot all pass, reply IMPOSSIBLE."
 )
 _MAX_SOURCE_CHARS = 12000
+_MARKER_SKIP = {
+    "ONLY", "NOT", "DO", "TXT", "ALL", "MUST", "NOTE", "IMPORTANT", "EXACTLY", "AND", "OR", "THE", "IMPOSSIBLE",
+    # служебные слова капсом рядом с answer.txt: кодировка, формат, регистр, каталог, запасной ответ
+    "CWD", "UTF", "UTF8", "JSON", "ASCII", "LF", "CRLF", "CR", "EOL", "EOF", "NEWLINE", "UPPERCASE", "LOWERCASE",
+    "CAPS", "ELSE", "FAILED", "FAIL", "FAILURE", "ERROR", "TODO", "README", "API", "CLI", "BASH", "PYTHON", "IF",
+    "THEN", "WHEN", "NO", "FILE", "WORD", "SINGLE", "TEXT", "PLAIN", "ANSWER", "CURRENT", "DIRECTORY",
+}
+_MARKER_SKIP_LOWER = {
+    "the", "a", "an", "it", "this", "that", "your", "its", "only", "just", "exactly", "out", "down", "them",
+    "output", "result", "results", "answer", "something", "anything", "nothing", "everything", "word", "text",
+}
+
+
+def answer_marker(instruction: str, sentinel: Optional[str]) -> str:
+    """Слово для answer.txt. Обычная форма («write ONLY the word X») разобрана в tasks.py и главнее.
+    Иначе — единственный кандидат во фразах про answer.txt (слово капсом, слово в кавычках, «the word X»,
+    «echo X >»). Кандидатов нет или их несколько — DONE, как в примерах: новое слово берём, только когда
+    оно однозначно."""
+    if sentinel:
+        return sentinel
+    text = re.sub(r"\((?:for example|e\.g\.|for instance)[^)]*\)", " ", instruction or "", flags=re.IGNORECASE)
+    sentences = [x.replace("answer.txt", " ") for x in re.split(r"(?<=[.!?;])\s+", text) if "answer.txt" in x]
+    found: dict[str, str] = {}
+    for x in sentences:
+        cands = re.findall(r"\becho\s+[\"']?(\w+)[\"']?\s*>", x)
+        # бэктики — код из условия (`pytest`, `total`): кандидат только слово капсом (`DONE`)
+        x = re.sub(r"`([^`\n]*)`", lambda m: m.group(0) if re.fullmatch(r"[A-Z][A-Z_]+", m.group(1)) else " ", x)
+        cands += re.findall(r"\bword\s+[\"'`]?(\w+)", x, re.IGNORECASE)
+        # «write fixed (and nothing else) to» — слово строчными сразу после глагола
+        cands += [w for w in re.findall(r"\b(?:write|put|save)\s+(\w+)\s+(?:\([^)]*\)\s+)?(?:to|in|into)\b",
+                                        x, re.IGNORECASE) if w.lower() not in _MARKER_SKIP_LOWER]
+        cands += re.findall(r"[\"'`](\w+)[\"'`]", x)
+        cands += re.findall(r"\b[A-Z][A-Z_]+\b", x)
+        for c in cands:
+            if not c.isdigit() and c.upper() not in _MARKER_SKIP:
+                found.setdefault(c.lower(), c)
+    if len(found) != 1 or "done" in found:
+        return "DONE"
+    return next(iter(found.values()))
+
+
 _MAX_TEST_CHARS = 4000
 
 
@@ -56,6 +99,8 @@ class CodingSolver(Solver):
         self.provisional = False                 # правка перебором записана, но ещё не сверена с моделью
         self.pre_mutation: Optional[tuple[dict, object]] = None   # (исходники, отчёт) до перебора мутаций
         self.partial: Optional[dict] = None      # частичная правка перебором: запасная основа, модели не показывается
+        self.marker = answer_marker(task.instruction, task.sentinel)
+        self.no_skills = False                   # навыки ищут тесты сами по шаблону имени — здесь им не место
 
     # ------------------------------------------------------------------ 0 токенов
     def prepare(self) -> None:
@@ -67,7 +112,16 @@ class CodingSolver(Solver):
             return
         self.tests = TR.test_files(self.ws)
         self.sources = TR.source_files(self.ws)
-        if not self.tests or not self.sources:
+        named = self._named_checks() if not self.tests and self.sources else None
+        if named is not None:
+            # Проверка названа в условии, но это не test_*.py: скрипт с assert (check.py) или doctest.
+            # Не «нет тестов»: файл проверки защищаем как тест; навыки (перебор, эталоны) ищут тесты по
+            # имени и «чинили» бы саму проверку, поэтому они выключены.
+            self.tests = named
+            self.sources = [p for p in self.sources if p not in named]
+            self.no_skills = True
+            self.note("named_checks", files=[self._rel(p) for p in named])
+        if (not self.tests and named is None) or not self.sources:
             what = "no test files" if not self.tests else "no source files to fix"
             # Нет тестов — нечего ни запускать, ни чинить: задачу нельзя проверить, токены не тратим.
             # Нет исходников при живых тестах — агент ещё может написать модуль по тестам.
@@ -113,8 +167,28 @@ class CodingSolver(Solver):
             if not self._reference_repair():
                 self._mutation_repair(allow_provisional=True)
 
+    def _named_checks(self) -> Optional[list[Path]]:
+        """Файлы проверки из команды условия (`python3 check.py`, `python3 -m doctest mylib.py`), если все есть.
+        Для doctest — пустой список: проверка внутри исходника. None — команды нет или файла нет."""
+        for m in re.finditer(r"`([^`\n]+)`", self.task.instruction or ""):
+            try:
+                parts = shlex.split(m.group(1))
+            except ValueError:
+                continue
+            if not parts or not (parts[0] in ("python", "python3") or parts[0].startswith("python3.")):
+                continue
+            files = [self.ws / a for a in parts[1:] if a.endswith(".py")]
+            if not files:
+                continue                     # `python -c ...`, `python -m pytest` — ищем дальше
+            if not all(p.is_file() for p in files):
+                return None
+            return [] if "doctest" in parts else files
+        return None
+
     def _reference_repair(self) -> bool:
         """Сломанные функции с известными именами заменяются эталонами (0 токенов, устойчиво к скрытым тестам)."""
+        if self.no_skills:
+            return False
         if self.reference_tried or self.report is None or self.report.ok:
             return False
         self.reference_tried = True
@@ -146,13 +220,13 @@ class CodingSolver(Solver):
         return False
 
     def _accept(self, how: str) -> None:
-        self.best = self.task.sentinel or "DONE"
+        self.best = self.marker
         self.status = "verified"
         self.note("accept", how=how)
 
     def _mutation_repair(self, allow_provisional: bool = False) -> bool:
         """Бесплатный ремонт перебором мутаций от лучшего на данный момент состояния."""
-        if self.repair_tried:
+        if self.repair_tried or self.no_skills:
             return False
         self.repair_tried = True
         try:
@@ -178,7 +252,7 @@ class CodingSolver(Solver):
                 # Тесты проходят, ответ уже можно записать. Но правка подобрана под видимые тесты:
                 # одной дешёвой попыткой модели проверяем, не подгонка ли это (см. skills/semantic.py).
                 self.provisional = True
-                self.best = self.task.sentinel or "DONE"
+                self.best = self.marker
                 self.status = "answered"
                 self.ladder = ("fast",)
                 self.note("accept_provisional", how="mutation repair; waiting for the model cross-check")
@@ -338,7 +412,7 @@ class CodingSolver(Solver):
         по имени, перебор — нет). Любой сбой оставляет правку перебором."""
         from ..skills.testrun import summarize_failures
 
-        done = Outcome("answer", answer=self.task.sentinel or "DONE")
+        done = Outcome("answer", answer=self.marker)
         base_texts, base_report = self.pre_mutation or (self.original, None)
         failures = summarize_failures(base_report, 1500) if base_report is not None else "(tests were not run)"
         prompt = f"{self._sources_text(base_texts)}\n\nFailing tests:\n{failures}"
@@ -431,7 +505,7 @@ class CodingSolver(Solver):
                   finish=reply.finish_reason, **({"reply": reply.text[:800]} if self.env.trace_text else {}))
         if is_refusal(reply.text):
             if await self._free_repair(step):
-                return Outcome("answer", answer=self.task.sentinel or "DONE")
+                return Outcome("answer", answer=self.marker)
             return Outcome("refused", note="model says the tests cannot all pass")
 
         files = {self._rel(p): text for p, text in self.current.items()}
@@ -451,7 +525,7 @@ class CodingSolver(Solver):
             report = await asyncio.to_thread(self._try, candidate)
             if report.ok:
                 self.current, self.report = candidate, report
-                return Outcome("answer", answer=self.task.sentinel or "DONE")
+                return Outcome("answer", answer=self.marker)
             if self.partial is not None:
                 # правка модели поверх частичной правки перебором: вместе они могут закрыть все тесты
                 combined = dict(self.partial)
@@ -464,7 +538,7 @@ class CodingSolver(Solver):
                 if both.ok:
                     self.current, self.report = combined, both
                     self.note("combined", how="model patch on top of the partial mutation repair")
-                    return Outcome("answer", answer=self.task.sentinel or "DONE")
+                    return Outcome("answer", answer=self.marker)
             improved = (self.report is not None and not report.error and not report.timed_out
                         and set(report.failed) < set(self.report.failed))
             if improved:
@@ -473,7 +547,7 @@ class CodingSolver(Solver):
                 await asyncio.to_thread(self._write, self.current)
             outcome = Outcome("failed", note=f"tests still fail: {', '.join(report.failed[:5]) or report.error[:80]}")
         if await self._free_repair(step):
-            return Outcome("answer", answer=self.task.sentinel or "DONE")
+            return Outcome("answer", answer=self.marker)
         return outcome
 
     async def _free_repair(self, step: str) -> bool:
@@ -531,6 +605,8 @@ class CodingSolver(Solver):
             fixed = {}
             for src in TR.source_files(work):
                 rel = src.relative_to(work)
+                if (self.ws / rel) in self.test_bytes:
+                    continue                 # файл проверки с необычным именем: правку агента не переносим
                 try:
                     fixed[self.ws / rel] = src.read_text(encoding="utf-8", errors="replace")
                 except OSError:
@@ -555,4 +631,4 @@ class CodingSolver(Solver):
 
         ok = await asyncio.to_thread(check)
         shutil.rmtree(work, ignore_errors=True)
-        return (self.task.sentinel or "DONE") if ok else None
+        return self.marker if ok else None

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import hashlib
 import re
 import time
@@ -48,7 +49,19 @@ class TestReport:
 # ---------------------------------------------------------------- файлы
 
 def _is_test_name(name: str) -> bool:
-    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith(("_test.py", "_tests.py"))
+                                     or name in ("test.py", "tests.py"))
+
+
+_TESTCASE_RE = re.compile(r"^class\s+\w+\(\s*(?:unittest\.)?TestCase\s*\)\s*:", re.M)
+
+
+def _has_testcase(path: Path) -> bool:
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:200000]
+    except OSError:
+        return False
+    return bool(_TESTCASE_RE.search(head))
 
 
 def _py_files(workspace: Path) -> list[Path]:
@@ -64,13 +77,22 @@ def _py_files(workspace: Path) -> list[Path]:
 
 
 def test_files(workspace: Path) -> list[Path]:
-    """test_*.py и *_test.py в workspace (рекурсивно, без скрытых и __pycache__)."""
-    return [p for p in _py_files(workspace) if _is_test_name(p.name)]
+    """test_*.py, *_test.py, test.py в workspace (рекурсивно, без скрытых и __pycache__).
+
+    Таких нет — файлы с классом-наследником unittest.TestCase: файл проверки с необычным именем
+    (check_mylib.py, run_tests.py) иначе считался бы исходником, задача объявлялась невыполнимой
+    («нет тестов»), а ремонт перебором «чинил» бы сам тест. При тестах по имени содержимое не смотрим:
+    исходник со своим самотестом (class _Smoke(unittest.TestCase)) остаётся исходником.
+    """
+    files = _py_files(workspace)
+    named = [p for p in files if _is_test_name(p.name)]
+    return named or [p for p in files if _has_testcase(p)]
 
 
 def source_files(workspace: Path) -> list[Path]:
     """Остальные .py-файлы workspace — то, что можно править."""
-    return [p for p in _py_files(workspace) if not _is_test_name(p.name)]
+    tests = set(test_files(workspace))
+    return [p for p in _py_files(workspace) if p not in tests]
 
 
 def snapshot(paths: Iterable[Path]) -> dict[str, str]:
@@ -102,6 +124,55 @@ def find_test_command(instruction: str, workspace: Path) -> list[str]:
     if len(tests) == 1:
         return sandbox.python_argv(str(tests[0].relative_to(workspace)))
     return sandbox.python_argv("-m", "unittest", "discover", "-v")
+
+
+@functools.lru_cache(maxsize=1)
+def _pytest_installed() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("pytest") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _wants_missing_pytest(argv: list[str]) -> bool:
+    if "pytest" not in argv[1:4] or argv[argv.index("pytest") - 1] != "-m":
+        return False
+    return not _pytest_installed()
+
+
+def _without_pytest(argv: list[str], workspace: Path) -> Optional[list[str]]:
+    """Замена `python -m pytest [файлы|каталоги]` без pytest: unittest для TestCase, plainrun для функций."""
+    workspace = Path(workspace)
+    args = argv[argv.index("pytest") + 1:]
+    named = [a.split("::")[0] for a in args if not a.startswith("-")]
+    tests: list[Path] = []
+    for item in named:
+        target = workspace / item
+        if target.is_file():
+            tests.append(target)
+        elif target.is_dir():
+            tests.extend(p for p in test_files(workspace) if target in p.parents)
+        else:
+            return None                      # аргумент непонятен — оставляем команду как есть
+    if not named:
+        tests = test_files(workspace)
+    if not tests:
+        return None
+    texts = []
+    for path in tests:
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return None
+    rels = [str(p.relative_to(workspace)) for p in tests]
+    if all(_TESTCASE_RE.search(t) for t in texts):
+        return sandbox.python_argv("-m", "unittest", "-v", *rels)
+    if not any(_TESTCASE_RE.search(t) for t in texts) and \
+            all(re.search(r"^(?:async\s+)?def test\w*\(", t, re.MULTILINE) for t in texts):
+        return sandbox.python_argv(str(Path(__file__).with_name("plainrun.py")), *rels)
+    return None
 
 
 def fallback_test_command(workspace: Path) -> Optional[list[str]]:
@@ -319,6 +390,10 @@ def run_tests(workspace: Path, argv: Optional[list[str]] = None, timeout: float 
     workspace = Path(workspace)
     if argv is None:
         argv = find_test_command("", workspace)
+    if _wants_missing_pytest(argv):
+        # pytest в окружении нет: команда из условия всегда падала бы с «No module named pytest»,
+        # и ни навык, ни модель не смогли бы подтвердить исправление. Те же тесты — без pytest.
+        argv = _without_pytest(argv, workspace) or argv
     started = time.monotonic()
     res = sandbox.run_argv(argv, workspace, timeout)
     output = res.stdout

@@ -32,7 +32,8 @@ REACT_SYSTEM = (
     "Use the bash tool to inspect files and run python3. Be economical: few short commands, "
     "never print large files, no explanations. When you have the result, write it to answer.txt "
     "exactly as the task says, then reply with the single word FINISHED. "
-    "If the task cannot be done, do not write answer.txt and reply IMPOSSIBLE."
+    "If a file, column, record or number the task needs does not exist, do not guess: "
+    "do not write answer.txt and reply IMPOSSIBLE right away. Never invent values."
 )
 _COUNTER = itertools.count(1)
 

@@ -47,7 +47,7 @@ class ScaleTest(unittest.TestCase):
         cfg.scale_to(100, 100)
         self.assertEqual(cfg.task_token_cap, 4000)
         self.assertEqual(cfg.tokens_per_point, 2000)
-        self.assertEqual(cfg.react_token_cap, 3500)
+        self.assertEqual(cfg.react_token_cap, 1500)
 
     def test_small_budget_shrinks_limits(self):
         cfg = Config(budget=300)

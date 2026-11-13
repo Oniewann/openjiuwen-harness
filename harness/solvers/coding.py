@@ -24,10 +24,10 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from ..llm import LLMDead, LLMError, TaskCapExceeded
+from ..llm import BudgetShort, LLMDead, LLMError, TaskCapExceeded
 from ..patching import apply_patch, split_by_file
-from ..textutil import approx_tokens, is_refusal
-from .base import ROLE_OF_STEP, Outcome, Solver
+from ..textutil import approx_tokens, is_refusal, strip_think
+from .base import CUT_OFF_NOTE, ROLE_OF_STEP, Outcome, Solver
 
 CODING_SYSTEM = (
     "You fix bugs in Python code so that the failing tests pass. Reply with ONLY one ```python code block "
@@ -36,6 +36,25 @@ CODING_SYSTEM = (
     "If the tests contradict each other or cannot all pass, reply IMPOSSIBLE."
 )
 _MAX_SOURCE_CHARS = 12000
+
+
+def _closed_code_block(text: str) -> bool:
+    """Есть хотя бы один закрытый блок ``` и нет незакрытого (как в base.ExprSolver).
+    Для оборванного ответа это значит: обрезан текст после кода, сама заплатка целая."""
+    fences = strip_think(text).count("```")
+    return fences >= 2 and fences % 2 == 0
+
+
+def _cut_off(reply) -> bool:
+    """Ответ оборван по max_tokens внутри кода. Хвост незакрытого блока проходит ast.parse, если
+    обрыв пришёлся на конец строки, но последняя функция в нём укорочена (потеряна ветка
+    `return 0`): видимые тесты она может пройти, скрытые — нет. Такую заплатку не применяем."""
+    return bool(reply.truncated) and not _closed_code_block(reply.text)
+
+
+def _cut_off_limit(usual: int) -> int:
+    """Лимит повтора после обрыва: ×3 от обычного, не выше 4000 (но и не меньше обычного)."""
+    return max(usual, min(3 * usual, 4000))
 _MARKER_SKIP = {
     "ONLY", "NOT", "DO", "TXT", "ALL", "MUST", "NOTE", "IMPORTANT", "EXACTLY", "AND", "OR", "THE", "IMPOSSIBLE",
     # служебные слова капсом рядом с answer.txt: кодировка, формат, регистр, каталог, запасной ответ
@@ -429,6 +448,10 @@ class CodingSolver(Solver):
         if is_refusal(reply.text):
             self.note("crosscheck", used="mutation", why="model refused")
             return done
+        if _cut_off(reply):
+            # правка перебором уже проходит тесты: обрубок не применяем и лимит ради сверки не поднимаем
+            self.note("crosscheck", used="mutation", why="reply cut off by the token limit")
+            return done
         files = {self._rel(p): text for p, text in base_texts.items()}
         patches = split_by_file(reply.text, files)
         candidate = dict(base_texts)
@@ -494,15 +517,30 @@ class CodingSolver(Solver):
         strong = role == "strong"
         messages = [{"role": "system", "content": CODING_SYSTEM},
                     {"role": "user", "content": self.user_prompt(step)}]
-        self.env.estimator.remember_prediction(self.task.task_id, step, self.family, self.features())
-        with self.env.hub.scope(self.task.task_id, self.family, step, cap=self.cfg.task_token_cap):
-            reply = await self.env.hub.chat(
-                messages, role=role,
-                max_tokens=self.cfg.max_tokens_strong if strong else self.cfg.max_tokens_code,
-                temperature=0.0 if step == "fast" else 0.3)
-        self.note(step, model=reply.model, cost=round(reply.cost, 1), prompt_tokens=reply.prompt_tokens,
-                  completion_tokens=reply.completion_tokens, reasoning_tokens=reply.reasoning_tokens,
-                  finish=reply.finish_reason, **({"reply": reply.text[:800]} if self.env.trace_text else {}))
+        usual = self.cfg.max_tokens_strong if strong else self.cfg.max_tokens_code
+        temperature = 0.0 if step == "fast" else 0.3
+        reply = await self._ask_code(step, messages, role, usual, temperature)
+        if not is_refusal(reply.text) and _cut_off(reply):
+            # Ответ оборван по max_tokens внутри кода: с тем же лимитом повтор оборвётся снова.
+            # Повтор с нуля (обрывок в истории только съел бы лимит) и с лимитом ×3, но не выше 4000;
+            # если на увеличенный вызов не хватает бюджета — с обычным лимитом (как в base.ExprSolver).
+            self.note(step, cut_off=True)
+            messages = [messages[0],
+                        {"role": "user", "content": messages[1]["content"] + "\n\n" + CUT_OFF_NOTE}]
+            try:
+                try:
+                    reply = await self._ask_code(step, messages, role, _cut_off_limit(usual), temperature)
+                except BudgetShort:
+                    reply = await self._ask_code(step, messages, role, usual, temperature)
+            except TaskCapExceeded as exc:
+                if await self._free_repair(step):
+                    return Outcome("answer", answer=self.marker)
+                return Outcome("failed", note=str(exc))
+            if not is_refusal(reply.text) and _cut_off(reply):
+                self.note(step, cut_off=True)
+                if await self._free_repair(step):
+                    return Outcome("answer", answer=self.marker)
+                return Outcome("failed", note="the reply was cut off by the token limit twice")
         if is_refusal(reply.text):
             if await self._free_repair(step):
                 return Outcome("answer", answer=self.marker)
@@ -549,6 +587,15 @@ class CodingSolver(Solver):
         if await self._free_repair(step):
             return Outcome("answer", answer=self.marker)
         return outcome
+
+    async def _ask_code(self, step: str, messages: list[dict], role: str, max_tokens: int, temperature: float):
+        self.env.estimator.remember_prediction(self.task.task_id, step, self.family, self.features())
+        with self.env.hub.scope(self.task.task_id, self.family, step, cap=self.cfg.task_token_cap):
+            reply = await self.env.hub.chat(messages, role=role, max_tokens=max_tokens, temperature=temperature)
+        self.note(step, model=reply.model, cost=round(reply.cost, 1), prompt_tokens=reply.prompt_tokens,
+                  completion_tokens=reply.completion_tokens, reasoning_tokens=reply.reasoning_tokens,
+                  finish=reply.finish_reason, **({"reply": reply.text[:800]} if self.env.trace_text else {}))
+        return reply
 
     async def _free_repair(self, step: str) -> bool:
         """Бесплатная страховка после неудачи модели: если баг — мутация одного оператора,

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -39,7 +40,10 @@ class MathSolver(ExprSolver):
         from ..skills.mathword import answer_math_question
 
         self.numbers = len(re.findall(r"\d+", self.task.question))
-        result = _safe(answer_math_question, self.task.question)
+        # имена файлов каталога задачи: «as listed in shipments.txt» невыполнима, только если такого файла нет
+        files = _safe(lambda: {p.name.lower() for p in self.task.workspace.rglob("*") if p.is_file()}
+                      if self.task.has_workspace else set(), default=None)
+        result = _safe(answer_math_question, self.task.question, files)
         if result is not None:
             if result.status == "ok" and result.answer is not None:
                 self.accept_skill(result.answer, result.expression)
@@ -96,7 +100,8 @@ class DataSolver(ExprSolver):
         by_name = {t.name: t for t in self.tables}
         self.main = next((by_name[Path(m).name] for m in mentioned if Path(m).name in by_name), self.tables[0])
         if mentioned and Path(mentioned[0]).name not in by_name:
-            self.mark_static_infeasible(0.6, f"file {mentioned[0]} is missing (found {sorted(by_name)})")
+            self.mark_static_infeasible(0.97 if _safe(self._other_file_absent, Path(mentioned[0]).name) else 0.6,
+                                        f"file {mentioned[0]} is missing (found {sorted(by_name)})")
         result = _safe(T.answer_table_question, self.main, self.task.question)
         if result is not None:
             if result.status == "ok" and result.answer is not None:
@@ -106,8 +111,143 @@ class DataSolver(ExprSolver):
                 # на другое название существующего столбца; иначе решает модель.
                 # 0.9, а не 0.97: формулировки в финале будут другими, столбец могут назвать иначе.
                 # Одна дешёвая попытка модели (~40 токенов) дешевле потерянной задачи; её отказ закрывает задачу.
-                self.mark_static_infeasible(0.9 if result.confirmed else 0.7, result.detail)
+                # Условие перечисляет столбец, а в файле ровно эти столбцы без него (убран, а не переименован) —
+                # тоже 0.9: его могут дать соседней таблицей или вычислить. Есть в другой таблице — 0.7.
+                removed = _safe(self._column_removed, result.detail)
+                elsewhere = _safe(self._column_elsewhere, result.detail)
+                self.mark_static_infeasible(0.7 if elsewhere else 0.9 if removed or result.confirmed else 0.7,
+                                            result.detail)
+            elif result.status == "empty" and _safe(self._value_absent, result.detail):
+                # «average price of product 'gizmo'», а такого значения в файле нет вовсе: среднего (max, min)
+                # от пустого набора не существует. Сумма и счёт сюда не попадают — для них ответ 0.
+                # 0.9: значение может быть закодировано («E» вместо «east», артикул вместо названия).
+                self.mark_static_infeasible(0.9, result.detail)
+            if result.status != "ok" and (self.p_infeasible_static or 0.0) < 0.95:
+                why = _safe(self._data_unusable)
+                if why:
+                    self.mark_static_infeasible(0.96, why)
         self.prepared = True
+
+    _NO_DATA = {"", "n/a", "na", "-", "--", "?", "??", "none", "null", "nan", "unknown", "tbd", "missing"}
+    # «ten», «twenty» в ячейке — тоже число, модель его прочтёт
+    _NUM_WORDS = {"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+                  "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+                  "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred",
+                  "thousand", "million", "dozen"}
+    _AGG_WORDS = r"(?:sum|total|average|avg|mean|median|maximum|max|minimum|min|highest|lowest|largest|smallest)"
+    _MAGIC = (b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ", b"SQLite format", b"\xff\xfe", b"\xfe\xff",
+              b"\xef\xbb\xbf", b"%PDF")
+
+    def _data_unusable(self) -> str:
+        """Данные есть, но ответа в них нет ни при каком прочтении: столбец, который агрегируют («average
+        price»), целиком из заглушек («n/a», «?»), или файл — двоичный мусор без единого столбца из условия.
+        Счёт строк и фильтр по такому столбцу («orders with no coupon») выполнимы — их не трогаем."""
+        from ..skills import tables as T
+
+        q = self.task.question
+        if not re.search(r"'[^']*(?:n/a|\?|many|none|unknown)[^']*'", q, re.IGNORECASE):
+            low = q.lower()
+            for col in self.main.columns:
+                key = T._key(col)
+                cells = [str(r.get(col, "")).strip().lower() for r in self.main.rows]
+                name = re.escape(col.lower()).replace(r"\_", "[ _]").replace("_", "[ _]")
+                # «average price», «total units», «how many units were sold» — сумма столбца units
+                agg = re.search(r"\b(?:" + self._AGG_WORDS + r"\s+(?:of\s+)?(?:the\s+)?(?:all\s+)?|how many\s+)"
+                                + name + r"s?\b", low)
+                # агрегировать нечего: ни одного числа, и хотя бы половина ячеек — явные пропуски («n/a», «?»)
+                if key and agg and cells and not any(re.search(r"\d", c) or set(re.findall(r"[a-z]+", c)) & self._NUM_WORDS
+                                                     for c in cells) \
+                        and sum(c in self._NO_DATA for c in cells) * 2 >= len(cells):
+                    return f"column {col!r} holds no values (only placeholders like {self.main.rows[0].get(col)!r})"
+        raw = self.main.path.read_bytes()[:65536]
+        if b"\x00" not in raw or raw.startswith(self._MAGIC):
+            return ""
+        # UTF-16/32 без метки: нули между байтами текста, текст читается
+        for enc, unit in (("utf-16-le", 2), ("utf-16-be", 2), ("utf-32-le", 4), ("utf-32-be", 4)):
+            try:
+                txt = raw[: len(raw) // unit * unit].decode(enc)
+            except UnicodeDecodeError:
+                continue
+            if sum(ch.isprintable() or ch in "\r\n\t" for ch in txt) >= 0.95 * max(1, len(txt)):
+                return ""
+        pm = T._PREAMBLE_RE.search(re.sub(r"\s+", " ", self.task.instruction))
+        if not pm or Path(pm.group(1)).name.lower() != self.main.name.lower():
+            return ""
+        listed = {T._key(c) for c in re.split(r"[,;]", pm.group(2)) if c.strip()}
+        if listed & {T._key(c) for c in self.main.columns}:
+            return ""
+        return f"{self.main.name} is binary garbage (no listed column readable)"
+
+    def _column_removed(self, detail: str) -> bool:
+        from ..skills import tables as T
+
+        m = re.search(r"no column '([^']+)'", detail)
+        pm = T._PREAMBLE_RE.search(re.sub(r"\s+", " ", self.task.instruction))
+        if not m or not pm or Path(pm.group(1)).name.lower() != self.main.name.lower():
+            return False
+        listed = {T._key(c) for c in re.split(r"[,;]", pm.group(2)) if c.strip()}
+        have = {T._key(c) for c in self.main.columns}
+        if not have or not have < listed:
+            return False      # в файле есть столбец, которого нет в условии: возможно, переименован
+        word = T._key(m.group(1))
+        forms = {word, word[:-1] if word.endswith("s") else word, word[:-2] if word.endswith("es") else word}
+        return bool(forms & (listed - have))
+
+    def _column_elsewhere(self, detail: str) -> bool:
+        """Столбец из вопроса есть в другой загруженной таблице («price» в prices.csv рядом с sales.csv)."""
+        from ..skills import tables as T
+
+        m = re.search(r"no column '([^']+)'", detail)
+        if not m:
+            return False
+        word = T._key(m.group(1))
+        forms = {word, word[:-1] if word.endswith("s") else word, word[:-2] if word.endswith("es") else word}
+        return any(forms & {T._key(c) for c in t.columns} for t in self.tables if t is not self.main)
+
+    def _value_absent(self, detail: str) -> bool:
+        if not re.search(r"\b(?:avg|max|min) of empty set$", detail) or not self.main.rows:
+            return False
+        values = re.findall(r"value '([^']+)' not found in column", detail)
+        if not values:
+            return False
+        try:
+            text = self.main.path.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            return False
+        # ни подстрокой, ни без учёта регистра, ни без окончания множественного числа: «Gizmo Pro», «widgets»
+        # при «widget» — уже не «нет такого значения». Сравниваем и без знаков и пробелов («widget_pro»,
+        # «WidgetPro» при «Widget Pro»), и по началу слова («Northern» при «north»): хоть что-то похоже — молчим.
+        squashed = re.sub(r"[^a-z0-9]", "", text)
+        cells = {re.sub(r"[^a-z0-9]", "", str(v).lower()) for r in self.main.rows for v in r.values()}
+        cells = {c for c in cells if len(c) >= 3 and not c.isdigit()}
+
+        def absent(v: str) -> bool:
+            v = v.strip().lower()
+            forms = [f for f in (v, v[:-1] if v.endswith("s") else "", v[:-2] if v.endswith("es") else "") if len(f) >= 2]
+            flat = re.sub(r"[^a-z0-9]", "", v)
+            if not forms or not flat or any(f in text for f in forms) or flat in squashed:
+                return False
+            return not any(c in flat or flat in c or len(os.path.commonprefix([c, flat])) >= 4 for c in cells)
+        return all(absent(v) for v in values)
+
+    def _other_file_absent(self, name: str) -> bool:
+        """Условие описывает другой файл («The file customers.csv has columns …»), а его нет: ни файла с таким
+        именем в любом формате, ни загруженной таблицы со всеми перечисленными столбцами. Тогда данных нет."""
+        from ..skills import tables as T
+
+        stem = Path(name).stem.lower()
+        if any(p.stem.lower() == stem for p in self.task.workspace.rglob("*")):
+            return False
+        if len(self.tables) <= 1:
+            return False      # таблица одна — скорее всего, она и есть описанная, только названа иначе
+        pm = T._PREAMBLE_RE.search(re.sub(r"\s+", " ", self.task.instruction))
+        if not pm or Path(pm.group(1)).name.lower() != name.lower():
+            return False
+        listed = {T._key(c) for c in re.split(r"[,;]", pm.group(2)) if c.strip()}
+        # таблица с тем же числом столбцов может быть описанной, только с иными заголовками («data.csv»: id,client,total)
+        if any(len(t.columns) == len(listed) for t in self.tables):
+            return False
+        return bool(listed) and not any(listed <= {T._key(c) for c in t.columns} for t in self.tables)
 
     def features(self) -> dict:
         q = self.task.question
@@ -190,8 +330,25 @@ class SearchSolver(ExprSolver):
                 elif result.status in ("no_anchor", "broken"):
                     # Вопрос разобран полностью, но данных для ответа в базе нет: это и есть
                     # «невыполнимая задача» по определению организаторов. Токены не тратим.
-                    self.mark_static_infeasible(0.96, result.detail)
+                    # Исключение: неизвестное имя похоже на запись («Hsu Ming-yang» при «Xu Mingyang») —
+                    # возможно, другая транслитерация: пусть модель попробует.
+                    near = result.status == "no_anchor" and _safe(self._near_missing_name, result.detail)
+                    self.mark_static_infeasible(0.9 if near else 0.96, result.detail)
+            if result is None or result.status == "unparsed":
+                # неизвестное имя необычного вида, имя без фамилии у нескольких записей, признак, которого
+                # в базе нет вообще (только высокоуверенные случаи, см. kb.infeasible_probe)
+                probe = _safe(K.infeasible_probe, self.kb, self.query)
+                if probe is not None:
+                    self.mark_static_infeasible(0.96, probe.detail)
         self.prepared = True
+
+    def _near_missing_name(self, detail: str) -> bool:
+        import ast
+
+        from ..skills import kb as K
+
+        m = re.search(r"no entry named ('.*'|\".*\")", detail)
+        return bool(m) and K.near_name(self.kb, ast.literal_eval(m.group(1)), self.query)
 
     def features(self) -> dict:
         if not self.kb:

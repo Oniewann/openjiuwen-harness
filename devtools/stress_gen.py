@@ -661,6 +661,26 @@ def m_i_deliveries_no_size(rng):
     return M(s, None)
 
 
+# --- math: выполнимые «почти невыполнимые» (P1-8): отсев без модели не должен их трогать
+
+
+@v("math", "mid")
+def m_n_near_inf(rng):
+    """Похоже на невыполнимую (нет начала, неточное число, посторонний склад), но ответ определён."""
+    val, s = _start(rng)
+    k, m, a = rng.randint(2, 6), rng.randint(20, 120), rng.randint(5, 40)
+    q, e = rng.choice([
+        (f"A new warehouse receives {k} deliveries of {m} boxes each. It ships {a} boxes. {QEND}", k * m - a),
+        (f"An empty warehouse receives {k} deliveries of {m} boxes each. {QEND}", k * m),
+        (f"A warehouse receives {k} deliveries of {m} boxes each. How many boxes did it receive in total?", k * m),
+        (f"{s[0]} It receives about {m} boxes. It ships {a} boxes per day for 2 days. "
+         f"How many boxes did it ship in total?", a * 2),
+        (f"{s[0]} It ships exactly {a} boxes per day for 3 days. {QEND}", val - 3 * a),
+        (f"{s[0]} It ships {a} boxes per day for 3 days. How many boxes are left in the warehouse?", val - 3 * a),
+    ])
+    return M([q], e, q=None)
+
+
 @v("math", "mid", "amb")
 def m_a_about(rng):
     val, s = _start(rng)
@@ -1289,6 +1309,19 @@ def s_i_empty_person_file(rng):
     spec = SQ(f"In which year was {p} born?", None, people, comps)
     spec["files"][f"kb/person_{_slug(p)}.md"] = ""
     return spec
+
+
+@v("search", "mid")
+def s_n_unique_first_name(rng):
+    """Только имя, но так зовут одну запись: ответ есть (отсев неоднозначных имён не должен сработать)."""
+    for _ in range(50):
+        people, comps = build_kb(rng)
+        words = [w for p in people for w in p.split()]
+        uniq = [p for p in people if words.count(p.split()[0]) == 1]
+        if uniq:
+            p = rng.choice(uniq)
+            return SQ(f"In which year was {p.split()[0]} born?", people[p]["Born"], people, comps)
+    raise RuntimeError("s_n_unique_first_name")
 
 
 @v("search", "hard", "amb")
@@ -3269,7 +3302,8 @@ def d_p5_plausible(rng):
         sel_pm = [r for r in sel_p if lo <= r["month"] <= hi]
         rev = lambda rs: sum(r["units"] * r["price"] for r in rs)  # noqa: E731
         cand = [
-            (f"What is the average price of product '{p}'?", repr(sum(r["price"] for r in sel_p) / len(sel_p)) if sel_p else None, "amb"),
+            # целое среднее — без «.0», как exact_int в примерах организаторов и как пишет решение
+            (f"What is the average price of product '{p}'?", (lambda a: str(int(a)) if a.is_integer() else repr(a))(sum(r["price"] for r in sel_p) / len(sel_p)) if sel_p else None, "amb"),
             (f"What is the total revenue (units times price) of product '{p}' in region '{g}'?", rev(sel_pg), "ok"),
             (f"What is the total revenue (units times price) of product '{p}' in months {lo} through {hi} inclusive?", rev(sel_pm), "ok"),
             (f"How many orders in region '{g}' have more than {t} units?", sum(1 for r in sel_g if r["units"] > t), "ok"),

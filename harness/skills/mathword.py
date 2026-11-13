@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 __all__ = ["MathAnswer", "answer_math_question"]
@@ -25,6 +26,7 @@ class MathAnswer:
     expression: str = ""        # python-выражение, дающее ответ
     steps: list[str] = field(default_factory=list)   # по строке на распознанное предложение
     detail: str = ""
+    asked: str = ""             # ok: что спрашивают — "stock" (итоговый запас) или "total" (сумма по глаголу)
 
 
 # Хвост инструкции харнесса: всё, начиная с этих фраз, к задаче не относится.
@@ -63,8 +65,20 @@ def _plural_re(word: str) -> str:
     return rf"(?:{w}|{w}s|{w}es)"
 
 
-def answer_math_question(question: str) -> MathAnswer:
-    """Решает задачу про запас; при любом сомнении — status="unparsed"."""
+def answer_math_question(question: str, workspace_files: Optional[set[str]] = None) -> MathAnswer:
+    """Решает задачу про запас; при любом сомнении — status="unparsed".
+
+    workspace_files — имена файлов в каталоге задачи (нижний регистр); None — каталог неизвестен.
+    """
+    result = _answer(question)
+    if result.status == "unparsed":
+        probe = _probe_infeasible(question, workspace_files)
+        if probe is not None:
+            return probe
+    return result
+
+
+def _answer(question: str) -> MathAnswer:
     text = re.sub(r"\s+", " ", question or "").strip()
     m = _TAIL_RE.search(text)
     if m:
@@ -305,7 +319,8 @@ def answer_math_question(question: str) -> MathAnswer:
         if eval(expr, {"__builtins__": {"abs": abs}}, {}) != value:  # noqa: S307
             return MathAnswer("error", steps=steps, expression=expr, detail="сумма расходится со счётом")
     steps.append(f"answer: {value}")
-    return MathAnswer("ok", answer=str(value), expression=expr, steps=steps)
+    return MathAnswer("ok", answer=str(value), expression=expr, steps=steps,
+                      asked="total" if asked_verb is not None else "stock")
 
 
 _SERVICE_RE = re.compile(r"answer\.txt|\bbash\b|\bpython\b|\bcurrent directory\b|\bwrite\b|\bsave\b|\bfile\b|\btool\b"
@@ -361,3 +376,95 @@ def _sentence_verb(sentence: str) -> Optional[str]:
     """Глагол операции, по которому её можно сложить в «сколько отгружено всего»."""
     found = [verb for verb, rx in _VERB_RE if rx.search(sentence)]
     return found[0] if len(found) == 1 else None
+
+
+# --------------------------------------------------------------------------- невыполнимые без модели
+# Приём один: условие не разобрано, но после ОДНОЙ замены (неточное число -> число, нет начала -> есть
+# начало, посторонний вопрос -> вопрос об итоговом запасе) оно разбирается целиком и спрашивает итоговый
+# запас. Значит, всё остальное понято, а ответа нет из-за этого места. Любая другая неясность — отказ.
+_INEXACT = (r"\b(?:at least|at most|no more than|no fewer than|no less than|not more than|not less than|more than"
+            r"|fewer than|less than|up to|about|around|approximately|roughly|nearly|almost|over|under|close to"
+            r"|just over|just under|well over|some)\s+(?=" + _NUM + r"\b)")
+_RANGES = (r"\bbetween " + _NUM + r" and " + _NUM + r"\b", r"\b" + _NUM + r" (?:to|or) " + _NUM + r"\b",
+           r"\b(\d+) ?[-–] ?(\d+)\b")
+_OP_VERBS = (r"(?:ships|sells|sends out|gives away|donates|uses|loses|receives|gets|buys|gains|doubles|triples"
+             r"|halves)")
+# Слова, говорящие о начальном запасе («a new warehouse» — начинает с нуля): с ними «нет начала» не утверждаем.
+_START_HINTS = re.compile(r"\b(?:new|newly|empty|zero|nothing|none|initially|originally|began|begins|started|starts"
+                          r"|start|before|fresh|opened|built|had|has|have|holds|held|stock of|inventory of)\b",
+                          re.IGNORECASE)
+_UNRELATED_Q = re.compile(
+    r"^(?!.*\bhow many\b)(?:what colou?rs? (?:are|is|were|was)\b|who\b|whom\b|whose\b|where\b"
+    r"|in (?:which|what) (?:city|town|country|state|street|place)\b"
+    r"|how (?:much|heavy) (?:does|do|is|are|did) .*\bweighs?\b|what does .*\bweigh\b"
+    r"|what is the (?:name|colou?r|address|weight)\b|what is (?:its|the warehouse's) (?:name|address)\b)[^0-9]*\?$",
+    re.IGNORECASE)
+_FILE_REF = re.compile(r"\b[\w\-]+\.(?:txt|csv|tsv|json|jsonl|xlsx|xls|dat|log|md|xml|ya?ml)\b", re.IGNORECASE)
+
+
+def _probe_infeasible(question: str, workspace_files: Optional[set[str]]) -> Optional[MathAnswer]:
+    text = re.sub(r"\s+", " ", question or "").strip()
+    m = _TAIL_RE.search(text)
+    body, tail = (text[: m.start()].strip(), text[m.start():]) if m else (text, "")
+    sentences = _split_sentences(body)
+    if len(sentences) < 2:
+        return None
+    sm = re.match(r"(?:a|an|the) [a-z]+(?: [a-z]+)? (?:starts|begins) with \S+ ([a-z]+)\.$", sentences[0], re.IGNORECASE)
+    qm = re.match(r"how many ([a-z]+)\b", sentences[-1], re.IGNORECASE)
+    item = (sm.group(1) if sm else qm.group(1) if qm else "boxes").lower()
+
+    def solved(new_body: str) -> bool:
+        res = _answer(new_body + (" " + tail if tail else ""))
+        return res.status == "ok" and res.asked == "stock"
+
+    def infeasible(why: str) -> MathAnswer:
+        return MathAnswer("infeasible", detail=why)
+
+    # 1. Неточное число: «about 30», «at least 30», «between 10 and 20», «10-20», «some/several», буква вместо числа.
+    mm = re.search(_INEXACT, body, re.IGNORECASE)
+    if mm and solved(body[: mm.start()] + body[mm.end():]):
+        return infeasible(f"в условии неточное число: {mm.group(0).strip()!r}")
+    for rx in _RANGES:
+        mm = re.search(rx, body, re.IGNORECASE)
+        if mm:
+            new = body[: mm.start()] + mm.group(1) + body[mm.end():]
+            if solved(new):
+                return infeasible(f"вместо числа диапазон: {mm.group(0)!r}")
+    for rx, why in ((_VAGUE, "в условии нет числа"), (_LETTER_VAR, "вместо числа буква")):
+        flags = re.IGNORECASE if rx is _VAGUE else 0
+        mm = re.search(rx, body, flags)
+        if mm:
+            new = body[: mm.start()] + "7" + body[mm.end():]
+            if solved(new):
+                return infeasible(f"{why}: {mm.group(0)!r}")
+    # 2. «It receives 3 deliveries.» — размер поставки не указан.
+    mm = re.search(r"\breceives (?:" + _NUM + r" deliveries|(?:a|one) delivery)(?=\.)", body, re.IGNORECASE)
+    if mm and solved(body[: mm.end()] + f" of 7 {item} each" + body[mm.end():]):
+        return infeasible(f"не указан размер поставки: {mm.group(0)!r}")
+    # 3. Нет начального запаса: «A warehouse ships 30 boxes per day…» без «starts with N».
+    fm = re.match(r"(?:a|an|the) ([a-z]+) (?=" + _OP_VERBS + r"\b)", sentences[0], re.IGNORECASE)
+    if fm and qm and not _START_HINTS.search(" ".join(sentences[:-1])) and fm.group(1).lower() not in _NOT_SUBJECT:
+        start = f"A {fm.group(1).lower()} starts with 7 {item}. It {sentences[0][fm.end():]}"
+        if solved(" ".join([start] + sentences[1:])):
+            return infeasible("в условии нет начального количества")
+    # 4. Число берётся из файла, которого у задачи нет: «It ships as many boxes as listed in shipments.txt.»
+    if workspace_files is not None:
+        for i, sent in enumerate(sentences[1:-1], start=1):
+            fr = _FILE_REF.search(sent)
+            if not fr or fr.group(0).lower() == "answer.txt" or Path(fr.group(0)).name.lower() in workspace_files:
+                continue
+            if not re.match(r"(?:(?:then|next|after that|later|finally),? )?(?:it|the [a-z]+) " + _OP_VERBS + r"\b",
+                            sent, re.IGNORECASE):
+                continue
+            # «It ships 30 boxes, as listed in orders.csv.» — число есть в самом условии, файл лишь ссылка
+            if re.search(r"\b" + _NUM + r"\b", _FILE_REF.sub(" ", sent), re.IGNORECASE):
+                continue
+            if solved(" ".join(sentences[:i] + sentences[i + 1:])):
+                return infeasible(f"число из файла {fr.group(0)}, а файла нет")
+    # 5. Вопрос не о количестве: «What color are the boxes?», «Who is the manager?».
+    last = sentences[-1]
+    if sm and _UNRELATED_Q.match(last) and solved(" ".join(sentences[:-1] + [f"How many {item} does it have at the end?"])):
+        return infeasible(f"вопрос не о количестве: {last!r}")
+    # Вопроса нет совсем («…It ships 5 boxes.») — не утверждаем: подразумеваемый вопрос об итоговом запасе
+    # мог быть выполнимым, а модель на такой задаче ответ запишет (для невыполнимой это баллов не стоит).
+    return None

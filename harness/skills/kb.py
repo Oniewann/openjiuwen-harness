@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -52,6 +53,10 @@ class KB:
     texts: dict[str, str] = field(default_factory=dict)                # название -> исходный текст
     duplicates: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)                # повторы с другим содержимым
+    # файл записи -> поле -> другие значения этого поля: (значение, из того же файла ли). «Born: 1980» и ниже
+    # «Born: 1985» — в том же файле; второй файл той же записи с «Born: 1987» — из другого. Совместимы ли
+    # значения со значением записи, решает _values_compatible при ответе.
+    field_conflicts: dict[str, dict[str, list[tuple[str, bool]]]] = field(default_factory=dict)
     total_chars: int = 0
 
     @property
@@ -121,17 +126,30 @@ def load_kb(kb_dir: Path, max_files: int = 5000) -> KB:
         if not records:
             title: Optional[str] = None
             fields: dict[str, Any] = {}
+            seen: dict[str, list[str]] = {}
+            headings = 0
             for line in text.splitlines():
                 stripped = _EMPHASIS_RE.sub("", line).strip()
                 if not stripped or stripped in ("---", "..."):
                     continue
+                if stripped.startswith("#"):
+                    headings += 1
                 if title is None and stripped.startswith("#"):
                     title = stripped.lstrip("#").strip()
                     continue
                 m = _FIELD_RE.match(stripped.strip("|").strip())
                 if m:
                     fields.setdefault(m.group(1).strip(), _convert(m.group(2).strip().strip('"').strip("'")))
+                    seen.setdefault(m.group(1).strip(), []).append(m.group(2).strip().strip('"').strip("'").lower())
             records = [(title, fields)]
+            # Повтор поля внутри одной записи («Born: 1983» и ниже «Born: 1988»). Заголовков больше одного или
+            # повторяется не одно поле — в файле, скорее, несколько записей: не судим.
+            repeated = [k for k, vals in seen.items() if len(vals) > 1]
+            if headings <= 1 and len(repeated) == 1:
+                for k in repeated:
+                    vals = seen[k]
+                    for v in vals[1:]:
+                        kb.field_conflicts.setdefault(str(path.relative_to(kb_dir)), {}).setdefault(k, []).append((v, True))
         for title, fields in records:
             if not title:
                 # заголовка нет: имя записи берём из поля name/title, иначе из имени файла
@@ -145,6 +163,12 @@ def load_kb(kb_dir: Path, max_files: int = 5000) -> KB:
                 kb.duplicates.append(title)
                 if kb.entries[title] != fields:
                     kb.conflicts.append(title)
+                    # одно и то же поле в двух файлах записи с разными значениями — какое верное, неизвестно;
+                    # поле, которое есть только в одном файле, противоречием не считаем
+                    old = kb.entries[title]
+                    for k in old:
+                        if k in fields and str(old[k]).lower() != str(fields[k]).lower():
+                            kb.field_conflicts.setdefault(kb.files[title], {}).setdefault(k, []).append((str(fields[k]), False))
                 continue
             kb.entries[title] = fields
             kb.files[title] = str(path.relative_to(kb_dir))
@@ -189,6 +213,126 @@ def _relink_titles(kb: KB) -> None:
             kb.texts[better] = kb.texts.pop(title)
 
 
+def _values_compatible(kb: KB, a: str, b: str) -> bool:
+    """Два значения одного поля записи не противоречат друг другу: «1983» и «March 4, 1983», «Dune Robotics»
+    и «[[Dune Robotics]]»/«Dune Robotics Inc.», «1983» и «Moscow». Противоречие — только годы без общего
+    или ссылки на разные записи, или разные строки, ни одна из которых не входит в другую."""
+    na = re.sub(r"[^a-z0-9]+", " ", fold_text(a)).strip()
+    nb = re.sub(r"[^a-z0-9]+", " ", fold_text(b)).strip()
+    if not na or not nb or na == nb or f" {na} " in f" {nb} " or f" {nb} " in f" {na} ":
+        return True
+    ya, yb = set(re.findall(r"\b(1\d{3}|20\d{2})\b", na)), set(re.findall(r"\b(1\d{3}|20\d{2})\b", nb))
+    if ya or yb:
+        # год против места («Born: 1983» и «Born: Moscow») — разные стороны одного факта
+        return bool(ya & yb) if ya and yb else True
+    ma = set(find_mentions(kb, a.replace("[[", " ").replace("]]", " ")))
+    mb = set(find_mentions(kb, b.replace("[[", " ").replace("]]", " ")))
+    if ma or mb:
+        return bool(ma & mb) if ma and mb else True
+    return False
+
+
+def fold_text(s: str) -> str:
+    """Нижний регистр без диакритики: «José García» -> «jose garcia», «Ångström» -> «angstrom»."""
+    s = s.replace("ß", "ss").replace("Ø", "O").replace("ø", "o").replace("Ł", "L").replace("ł", "l")
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch)).lower()
+
+
+def fold_name(s: str) -> set[str]:
+    """Варианты имени для сравнения: без диакритики, апострофов, дефисов и пробелов; ü -> u и ü -> ue.
+    «Seán O'Brien» и «Sean OBrien» -> «seanobrien»; «Lena Müller» -> {«lenamuller», «lenamueller»}."""
+    out = set()
+    for variant in (s, re.sub(r"[äöüÄÖÜ]", lambda m: {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe",
+                                                         "Ü": "Ue"}[m.group(0)], s)):
+        out.add(re.sub(r"[^a-z0-9]", "", fold_text(variant)))
+    return {v for v in out if v}
+
+
+def near_name(kb: KB, name: str, context: str = "") -> bool:
+    """Имя похоже на запись базы, хотя и не совпало: другая транслитерация («Hsu Ming-yang» при «Xu Mingyang»),
+    опечатка. Тогда «такой записи нет» не утверждаем уверенно. context — вопрос: из него имя дополняется
+    отрезанными частями через дефис или апостроф («Hsu Ming» -> «Hsu Ming-yang»)."""
+    from difflib import SequenceMatcher
+
+    m = re.search(r"(?<![\w])" + re.escape(name) + r"(?:[\-'’][^\W\d_]+)*", context) if context else None
+    if m:
+        name = m.group(0)
+    q = fold_name(name)
+    q_tokens = [t for t in re.split(r"[^a-z0-9]+", fold_text(name)) if t]
+    # признаки транслитерации: дефис, апостроф, диакритика
+    translit = bool(re.search(r"[\-'’]", name)) or fold_text(name) != name.lower()
+
+    def close(a: str, b: str) -> bool:
+        return SequenceMatcher(None, a, b).ratio() >= 0.8 or (min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a)))
+
+    # Уменьшительное имя («Bob Lee» при «Robert Lee», «Liz Ford» при «Elizabeth Ford»): фамилия совпала ровно
+    # с одной записью. Компания с другим окончанием («Helix Motor Company» при «Helix Motors»).
+    if len(q_tokens) >= 2:
+        same_last = [t for t in kb.entries if (fold_text(t).split() or [""])[-1] == q_tokens[-1]]
+        if len(same_last) == 1:
+            return True
+        # «Irene Smith» при «Irina Smith», «Alex Novak» при «Alexandra Novak»: та же фамилия, имя начинается так же
+        if any(fold_text(t).split()[0][:2] == q_tokens[0][:2] for t in same_last):
+            return True
+        if q_tokens[-1] in _COMPANY_SUFFIXES:
+            for title in kb.entries:
+                t_tokens = [w for w in re.split(r"[^a-z0-9]+", fold_text(title)) if w]
+                if all(any(close(a, b) for b in t_tokens) for a in q_tokens[:-1]):
+                    return True
+    for title in kb.entries:
+        if any(SequenceMatcher(None, x, y).ratio() >= 0.85 for x in q for y in fold_name(title)):
+            return True
+        t_tokens = [w for w in re.split(r"[^a-z0-9]+", fold_text(title)) if w]
+        if q_tokens and all(any(close(a, b) for b in t_tokens) for a in q_tokens):
+            return True
+        if translit and any(len(a) >= 3 and any(close(a, b) for b in t_tokens) for a in q_tokens):
+            return True
+    return False
+
+
+_COMPANY_SUFFIXES = {"company", "co", "inc", "corp", "corporation", "ltd", "limited", "llc", "group", "plc", "gmbh"}
+
+
+# слово имени: апостроф внутри («O'Brien») — да, притяжательное «'s» — нет
+_FOLD_SPAN_RE = re.compile(r"[^\W\d_](?:[\w\-]|['’](?!s\b)\w)*")
+
+
+def _fold_canonicalize(kb: KB, text: str) -> str:
+    """«Jose Garcia» -> «José García», если так (без диакритики, апострофов, дефисов) называется ровно одна
+    запись; при двух подходящих записях ничего не меняем."""
+    folded: dict[str, set[str]] = {}
+    for title in kb.entries:
+        for v in fold_name(title):
+            if len(v) >= 4:
+                folded.setdefault(v, set()).add(title)
+    words = list(_FOLD_SPAN_RE.finditer(text))
+    out, shift, i = text, 0, 0
+    while i < len(words):
+        done = False
+        for n in range(min(4, len(words) - i), 0, -1):
+            first, last = words[i], words[i + n - 1]
+            if not first.group(0)[0].isupper():
+                break
+            span = text[first.start():last.end()]
+            if not re.fullmatch(r"[\w'’\-]+(?:\s+[\w'’\-]+)*", span):
+                continue
+            titles = set().union(*(folded.get(v, set()) for v in fold_name(span)))
+            if len(titles) == 1 and span not in titles:
+                title = titles.pop()
+                out = out[: first.start() + shift] + title + out[last.end() + shift:]
+                shift += len(title) - len(span)
+                i += n
+                done = True
+                break
+            if titles:
+                i += n
+                done = True
+                break
+        if not done:
+            i += 1
+    return out
+
+
 def find_mentions(kb: KB, text: str) -> list[str]:
     """Названия записей, встречающиеся в тексте (самые длинные совпадения, без вложенных)."""
     found: list[tuple[int, int, str]] = []
@@ -210,8 +354,9 @@ def find_mentions(kb: KB, text: str) -> list[str]:
 
 
 def canonicalize_question(kb: KB, text: str) -> str:
-    """Приводит имена записей в вопросе к написанию из базы: «irina smith», «Smith, Irina» -> «Irina Smith»."""
-    out = text
+    """Приводит имена записей в вопросе к написанию из базы: «irina smith», «Smith, Irina» -> «Irina Smith»,
+    «Jose Garcia» -> «José García»."""
+    out = _fold_canonicalize(kb, text)
     low = out.lower()
     for title in sorted(kb.entries, key=len, reverse=True):
         if len(title) < 4:
@@ -394,11 +539,33 @@ def answer_path_question(kb: KB, question: str) -> PathAnswer:
         if not isinstance(current, str) or current not in kb.entries:
             return PathAnswer("broken", chain=chain, anchor=anchor,
                               detail=f"hop {hop}: {current!r} has no entry in the knowledge base")
-        record = kb.entries[current]
+        record, record_title = kb.entries[current], current
+        if name in record:
+            for other, same_file in kb.field_conflicts.get(kb.files.get(current, ""), {}).get(name, ()):
+                if _values_compatible(kb, str(record[name]), other):
+                    continue
+                # Навык не отвечает, но и невыполнимость не утверждает: внутри файла это бывает историей
+                # («Employer: A», ниже «Employer: B»), между файлами — пометкой («Ember Bio (former)»). Решает модель.
+                where = "twice" if same_file else "in two files"
+                return PathAnswer("unparsed", chain=chain, anchor=anchor,
+                                  detail=f"hop {hop}: entry {current!r} lists {name!r} {where}: {record[name]!r}, {other!r}")
+        if name not in record and current in kb.duplicates:
+            # у записи несколько файлов: поле может быть только во втором — решает модель
+            return PathAnswer("unparsed", chain=chain, anchor=anchor,
+                              detail=f"hop {hop}: entry {current!r} (several files) has no field {name!r} in the first")
         if name not in record:
             return PathAnswer("broken", chain=chain, anchor=anchor,
                               detail=f"hop {hop}: entry {current!r} has no field {name!r}")
         current = record[name]
+        if isinstance(current, str) and current not in kb.entries:
+            # «[[Dune Robotics]]» — ссылка на запись; «Dune Robotics Inc.», а второй файл записи пишет
+            # «Dune Robotics» — берём совместимое значение, которое и есть запись
+            alts = [current] + [o for o, _ in kb.field_conflicts.get(kb.files.get(record_title, ""), {}).get(name, ())]
+            for value in alts:
+                value = re.sub(r"^\[\[([^\]|]+)(?:\|[^\]]*)?\]\]$", r"\1", value.strip()).strip()
+                if value in kb.entries and _values_compatible(kb, current, value):
+                    current = value
+                    break
     answer = str(current).strip()
     if answer.lower() in _NO_VALUE or not answer:
         return PathAnswer("broken", chain=chain, anchor=anchor, detail=f"value of {chain[-1]!r} is {answer!r}: no data")
@@ -558,3 +725,94 @@ def answer_relation_question(kb: KB, question: str) -> PathAnswer:
             return PathAnswer("broken", anchor=target, detail=f"nobody has {field_name} = {target!r}")
         return PathAnswer("unparsed", anchor=target, detail=f"{len(hits)} entries have {field_name} = {target!r}")
     return PathAnswer("unparsed", detail="not a comparison or inverse question")
+
+
+# --------------------------------------------------------------------------- невыполнимые без модели
+# Тот же приём, что в mathword: вопрос не разобран, но после одной подстановки (неизвестное имя -> имя
+# записи) разбирается целиком. Плюс проверка по всему тексту базы: если ни одного слова из имени в базе
+# нет вообще (и имя не похоже ни на одну запись), база ответить не может — как ни переформулируй вопрос.
+_TITLE_ABBR_RE = re.compile(r"\b(Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St)\.\s")
+_NAME_RUN_RE = re.compile(r"(?<![\w'’\-])([A-Z][\w'’\-]*(?:\s+[A-Z][\w'’\-]*)*)")
+
+
+def _kb_words(kb: KB) -> Optional[tuple[set[str], str]]:
+    """Все слова всех файлов каталога базы (нижний регистр) и имена файлов, плюс весь текст одной строкой
+    без пробелов и знаков («Nova Tech» -> «novatech»). None — есть нечитаемый файл."""
+    words: set[str] = set()
+    squashed: list[str] = []
+    root = kb.root
+    if root is None or not Path(root).is_dir():
+        return None
+    for path in Path(root).rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in _TEXT_SUFFIXES:
+            return None          # pdf, docx, картинка: что в них — не знаем
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        folded = fold_text(text + " " + path.name)
+        words.update(re.findall(r"[a-z0-9]+", folded))
+        squashed.append(re.sub(r"[^a-z0-9]", "", folded))
+    return words, "|".join(squashed)
+
+
+def _question_runs(q: str) -> list[str]:
+    """Сочетания слов с заглавной буквы (кандидаты в имена), без служебных слов в начале."""
+    runs = []
+    for m in _NAME_RUN_RE.finditer(q):
+        parts = m.group(1).split()
+        while parts and parts[0].lower() in _FILLER:
+            parts = parts[1:]
+        if parts:
+            runs.append(" ".join(parts))
+    return runs
+
+
+def infeasible_probe(kb: KB, question: str) -> Optional[PathAnswer]:
+    """Высокоуверенные невыполнимые вопросы, которые answer_path_question не разобрал. None — не утверждаем."""
+    if not kb.structured or not kb.entries:
+        return None
+    q = _single_question(_TITLE_ABBR_RE.sub(lambda m: m.group(1) + " ", question))
+    if q is None:
+        return None
+    scanned = _kb_words(kb)
+    if scanned is None:
+        return None
+    words, squashed = scanned
+    anchors = find_mentions(kb, q)
+    if not anchors:
+        runs = _question_runs(q)
+        if len(runs) != 1:
+            return None
+        name = runs[0]
+        tokens = [t for t in re.findall(r"[a-z0-9]+", fold_text(name))
+                  if len(t) >= 2 and t.lower() not in ("dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st")]
+        if not tokens:
+            return None
+        # 1. Имени нет в базе ни целиком, ни по частям, а вопрос с именем записи на его месте разбирается.
+        # и даже как часть слова («NovaTech» при «Nova Tech», «Liam» внутри «William») — иначе не утверждаем
+        if not any(t in words or (len(t) >= 3 and t in squashed) for t in tokens) and not near_name(kb, name):
+            for title in list(kb.entries)[:60]:
+                res = answer_path_question(kb, q.replace(name, title))
+                if res.ok:
+                    return PathAnswer("no_anchor", detail=f"no entry named {name!r} (no part of it in the knowledge base)")
+            return None
+        # 2. Только имя, и так зовут нескольких: ответы для них разные — однозначного ответа нет.
+        if len(tokens) == 1 and len(name.split()) == 1:
+            cands = [t for t in kb.entries if name in t.split()]
+            if len(cands) < 2:
+                return None
+            answers = set()
+            for title in cands:
+                res = answer_path_question(kb, re.sub(r"(?<![\w])" + re.escape(name) + r"(?![\w])", title, q))
+                if not res.ok:
+                    return None
+                answers.add(res.answer)
+            if len(answers) >= 2:
+                return PathAnswer("broken", detail=f"{name!r} matches {len(cands)} entries with different answers")
+        return None
+    # 3. Признак, которого нет ни в одной записи («What is X's salary?»), не утверждаем: его называют синонимами
+    # («Remuneration:», «Tel:», «Headquarters:») или пишут в прозе (адрес почты в тексте) — решает модель.
+    return None

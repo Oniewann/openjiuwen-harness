@@ -142,8 +142,12 @@ def canonical_number(text: str) -> str:
     return sign + whole + ("." + frac if frac else "")
 
 
-_PLACES_RE = re.compile(r"\b(?:to|with)\s+(\d+|one|two|three|four|five|six)\s+decimal\s+(?:places?|digits?)\b",
+_PLACES_RE = re.compile(r"\b(?:to|with)\s+(?:exactly\s+)?(\d+|one|two|three|four|five|six)\s+decimal\s+(?:places?|digits?)\b",
                         re.IGNORECASE)
+# Явно «ровно N знаков» («exactly 2 decimal places», «formatted to 2 decimal places»): нули в конце
+# дописываются (25.40); просто «rounded to N» — как print(round(x, N)), без нулей.
+_EXACT_PLACES_RE = re.compile(r"\bexactly\s+(?:\d+|one|two|three|four|five|six)\s+decimal|"
+                              r"\bformat(?:ted)?\b[^.?!]{0,40}\bdecimal", re.IGNORECASE)
 _PLACES_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
 # Вопрос сам говорит о виде числа — нули в дробной части не трогаем.
 _FORMAT_WORDS_RE = re.compile(r"round|decimal|cent|digit|place|precision|significant|format|percent|%|fraction",
@@ -189,6 +193,9 @@ def fit_number_to_question(value: str, question: str, computed: bool = True) -> 
             out = repr(round(float(value), n))
             if "e" in out.lower():
                 out = f"{round(float(value), n):.{n}f}"
+        if _EXACT_PLACES_RE.search(question):
+            out = f"{round(float(out), n):.{n}f}"
+            return out.lstrip("-") if float(out) == 0 else out
         # как print(round(x, N)): нули в конце не дописываются (25.4, а не 25.40); целое — целым
         if "." in out:
             out = out.rstrip("0")

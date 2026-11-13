@@ -110,3 +110,20 @@ class ShapeAnswerNumbers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExactPlaces(unittest.TestCase):
+    """«exactly N decimal places» / «formatted to N decimal places» — ровно N знаков, с нулями."""
+
+    def test_exact_pads(self):
+        for q in ("What is the average price, rounded to exactly 2 decimal places?",
+                  "What is the average price? Give the answer with exactly two decimal places.",
+                  "What is the average price, formatted to 2 decimal places?"):
+            self.assertEqual(fit_number_to_question("25.4", q), "25.40", q)
+            self.assertEqual(fit_number_to_question("46", q), "46.00", q)
+            self.assertEqual(fit_number_to_question("23.456", q), "23.46", q)
+
+    def test_plain_rounded_unchanged(self):
+        q = "What is the average price, rounded to 2 decimal places?"
+        self.assertEqual(fit_number_to_question("25.40", q), "25.4")
+        self.assertEqual(fit_number_to_question("46", q), "46")

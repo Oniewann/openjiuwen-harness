@@ -146,7 +146,7 @@ class Scheduler:
             return WAIT   # не влезает только из-за резерва запущенных вызовов: подождать их
         # Дорогие ступени — только при большом запасе: при тесном бюджете их токены нужнее
         # первым попыткам других задач.
-        if step == "strong" and remaining < 5 * max(est.cost, 1500.0):
+        if step == "strong" and remaining < 5 * max(est.cost, 1000.0):
             return "too little budget left for a reasoning model"
         if step == "react" and remaining < 10 * self.cfg.react_token_cap:
             return "too little budget left for the agent"

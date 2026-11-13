@@ -233,7 +233,8 @@ class LLMHub:
         """Меньше этого max_tokens вызов почти наверняка бесполезен (модель с рассуждениями
         тратит всё на рассуждения и возвращает пустой ответ; код обрывается)."""
         if not model_name.endswith("-noreason"):
-            return 1500
+            # Замер 13.11: qwen3.8-27b отвечает от 500 токенов, qwen3.6-35b-a3b — от 1000.
+            return 1000
         if max_tokens >= self.cfg.max_tokens_code:
             return 300
         return 60

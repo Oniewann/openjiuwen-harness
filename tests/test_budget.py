@@ -131,7 +131,7 @@ class HubBudgetTest(unittest.TestCase):
         self.assertEqual(called, [])
 
     def test_strong_needs_room(self):
-        hub = self._hub(1200)
+        hub = self._hub(1000)
 
         async def raw(messages, kwargs):
             return _Msg()

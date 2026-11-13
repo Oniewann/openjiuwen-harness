@@ -23,15 +23,17 @@ from typing import Optional
 
 from ..config import Config
 from ..estimator import Estimator, Evidence
-from ..llm import LLMDead, LLMError, LLMHub, Reply, TaskCapExceeded
+from ..llm import BudgetShort, LLMDead, LLMError, LLMHub, Reply, TaskCapExceeded
 from ..pot import PotResult, looks_like_code, run_pot
 from ..tasks import Task
 from ..textutil import (approx_tokens, extract_code, fit_number_to_question, is_refusal, looks_integer,
-                        normalize_answer)
+                        normalize_answer, strip_think)
 
 # Вес источника при голосовании.
 VOTE_WEIGHT = {"skill": 1.5, "fast": 1.0, "fast_alt": 1.0, "strong": 2.0, "react": 1.5}
 ROLE_OF_STEP = {"fast": "fast", "fast_retry": "fast", "fast_alt": "fast_alt", "strong": "strong"}
+# Ответ оборван по max_tokens без законченного блока кода (см. _interpret).
+CUT_OFF_NOTE = "Your previous reply was cut off by the token limit. Reply with the code only, no explanation."
 
 
 @dataclass
@@ -304,10 +306,20 @@ class ExprSolver(Solver):
         # вид числа: ровно N знаков для «rounded to N decimal places», иначе как print()
         return fit_number_to_question(v, q, computed=getattr(self, "family", "") != "search"), ""
 
-    async def _ask(self, step: str, messages: list[dict], temperature: float = 0.0) -> Reply:
+    def _step_max_tokens(self, step: str) -> int:
         role = ROLE_OF_STEP.get(step, "fast")
-        strong = role == "strong"
-        max_tokens = self.cfg.max_tokens_strong if strong else (self.max_tokens_fast or self.cfg.max_tokens_fast)
+        return self.cfg.max_tokens_strong if role == "strong" else (self.max_tokens_fast or self.cfg.max_tokens_fast)
+
+    def _cut_off_max_tokens(self, step: str) -> int:
+        """Лимит повтора после обрыва: ×3 от обычного, не выше 4000 (но и не меньше обычного)."""
+        usual = self._step_max_tokens(step)
+        return max(usual, min(3 * usual, 4000))
+
+    async def _ask(self, step: str, messages: list[dict], temperature: float = 0.0,
+                   max_tokens: Optional[int] = None) -> Reply:
+        role = ROLE_OF_STEP.get(step, "fast")
+        if max_tokens is None:
+            max_tokens = self._step_max_tokens(step)
         self.env.estimator.remember_prediction(self.task.task_id, step, self.family, self.features())
         with self.env.hub.scope(self.task.task_id, self.family, step, cap=self.cfg.task_token_cap):
             return await self.env.hub.chat(messages, role=role, max_tokens=max_tokens, temperature=temperature)
@@ -342,9 +354,22 @@ class ExprSolver(Solver):
                 # одна попытка исправления той же моделью: дешевле, чем подниматься на ступень выше
                 self.shaky = True
                 first = self._attempt
-                messages += [{"role": "assistant", "content": reply.text[:1500]},
-                             {"role": "user", "content": self.retry_prompt(error)}]
-                reply = await self._ask(step, messages, temperature=0.3)
+                if reply.truncated:
+                    # Первый ответ оборван по max_tokens: с тем же лимитом повтор оборвётся снова.
+                    # Повтор с нуля (обрывок в истории только съел бы лимит) и с лимитом ×3, но не
+                    # выше 4000; остаток бюджета урежет его сам (llm.py), а если на увеличенный
+                    # вызов не хватает минимума — повтор с обычным лимитом.
+                    messages = [messages[0],
+                                {"role": "user", "content": messages[1]["content"] + "\n\n" + CUT_OFF_NOTE}]
+                    try:
+                        reply = await self._ask(step, messages, temperature=0.3,
+                                                max_tokens=self._cut_off_max_tokens(step))
+                    except BudgetShort:
+                        reply = await self._ask(step, messages, temperature=0.3)
+                else:
+                    messages += [{"role": "assistant", "content": reply.text[:1500]},
+                                 {"role": "user", "content": self.retry_prompt(error)}]
+                    reply = await self._ask(step, messages, temperature=0.3)
                 outcome, error = await self._interpret(step, reply, previous=first)
                 if outcome is None:
                     outcome = Outcome("failed", note=error)
@@ -371,6 +396,12 @@ class ExprSolver(Solver):
             return Outcome("refused", note="model says the task is impossible"), ""
         if not text.strip():
             return None, "empty reply" + (" (cut off by the token limit)" if reply.truncated else "")
+        if reply.truncated and not self._closed_code_block(text):
+            # Ответ оборван по max_tokens, а законченного блока кода нет: исполнимый префикс
+            # обрубка даёт промежуточное значение («price = 12*3.5\nprice» без «* 1.08»),
+            # короткое значение без кода тоже могло оборваться. Только на повтор.
+            self.note(step, cut_off=True)
+            return None, CUT_OFF_NOTE
         code = extract_code(text)
         if not looks_like_code(code):
             # модель ответила значением, а не кодом — принимаем короткий ответ как есть,
@@ -409,6 +440,13 @@ class ExprSolver(Solver):
         if result.missing_data and self.refusal_on_missing_data():
             return Outcome("refused", note=result.error), ""
         return None, result.error or "no result"
+
+    @staticmethod
+    def _closed_code_block(text: str) -> bool:
+        """В ответе есть хотя бы один закрытый блок ``` и нет незакрытого (чётное число ограждений).
+        Для оборванного ответа это значит: обрезано пояснение после кода, сам код целый."""
+        fences = strip_think(text).count("```")
+        return fences >= 2 and fences % 2 == 0
 
     # ------------------------------------------------------------------ «данных нет» и заземление
     def absent_input(self, result: PotResult) -> str:
